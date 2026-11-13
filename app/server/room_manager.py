@@ -7,6 +7,8 @@ import logging
 from typing import Dict, Set, Optional, TYPE_CHECKING
 from collections import defaultdict
 
+from ..core.protocol import encode_frame
+
 if TYPE_CHECKING:
     from .connection import ClientConnection
 
@@ -35,7 +37,32 @@ class RoomManager:
         
         self._stats_lock = asyncio.Lock()
         self._message_count: int = 0
-        
+
+        # username -> its connection. One live connection per name, so
+        # USER_JOINED/MSG attribution and per-user rate limits mean something.
+        self._usernames: Dict[str, "ClientConnection"] = {}
+
+    def claim_username(self, username: str, connection: "ClientConnection") -> bool:
+        """Reserve a username for this connection. False if another live
+        connection holds it (names compare case-insensitively)."""
+        key = username.casefold()
+        holder = self._usernames.get(key)
+        if holder is not None and holder is not connection:
+            return False
+        self._usernames[key] = connection
+        return True
+
+    def release_username(self, username: Optional[str], connection: "ClientConnection") -> None:
+        """Free a username, only if this connection is the one holding it."""
+        if username is None:
+            return
+        key = username.casefold()
+        if self._usernames.get(key) is connection:
+            del self._usernames[key]
+
+    def is_member(self, room_name: str, connection: "ClientConnection") -> bool:
+        return connection in self._rooms.get(room_name, ())
+
     def join(self, room_name: str, connection: "ClientConnection") -> int:
         """
         Subscribe a connection to a room.
@@ -139,9 +166,13 @@ class RoomManager:
         if not recipients:
             return 0
         
-        # Send to all recipients concurrently
+        # Encode once; every recipient gets the same bytes. Then send to all
+        # recipients concurrently. A healthy recipient's send completes
+        # without waiting; a backed-up one waits at most write_timeout and is
+        # then disconnected, so one slow client cannot stall the room.
+        frame = encode_frame(message)
         send_tasks = [
-            self._safe_send(conn, message)
+            self._safe_send(conn, message, frame)
             for conn in recipients
         ]
         
@@ -161,8 +192,9 @@ class RoomManager:
     
     async def _safe_send(
         self, 
-        connection: "ClientConnection", 
-        message: Dict
+        connection: "ClientConnection",
+        message: Dict,
+        frame: Optional[bytes] = None,
     ) -> bool:
         """
         Safely send message to a connection with error handling.
@@ -170,14 +202,16 @@ class RoomManager:
         Returns:
             True if successful, False otherwise
         """
+        if getattr(connection, "closed", False):
+            return False  # already leaving; not a delivery
         try:
-            await connection.send(message)
+            if frame is not None and hasattr(connection, "send_bytes"):
+                await connection.send_bytes(frame)
+            else:
+                await connection.send(message)
             return True
         except Exception as e:
-            logger.error(
-                f"Failed to send to {connection.username}: {e}",
-                exc_info=True
-            )
+            logger.warning(f"Failed to send to {connection.username}: {e!r}")
             # Don't propagate - connection will be cleaned up by its own handler
             return False
     
@@ -193,7 +227,7 @@ class RoomManager:
         """Get system statistics."""
         return {
             "total_rooms": len(self._rooms),
-            "total_connections": len(self._user_rooms),
+            "total_connections": len(self._usernames),
             "total_messages": self._message_count,
             "rooms": {
                 name: len(members) 

@@ -16,7 +16,7 @@ from typing import Dict, Any, Optional
 from asyncio import StreamReader, StreamWriter
 
 from .exceptions import DisconnectError, FramingError, InvalidMessageError
-from .config import get_server_config
+from .config import ServerConfig, get_server_config
 
 
 # Constants
@@ -27,8 +27,10 @@ def get_max_frame_size() -> int:
     """Get max frame size from config."""
     try:
         return get_server_config().max_frame_size
-    except:
-        return 10 * 1024 * 1024  # Fallback
+    except ValueError:
+        # A malformed environment variable: fall back to the safe default
+        # rather than to an arbitrarily large limit.
+        return ServerConfig().max_frame_size
 
 
 async def read_frame(reader: StreamReader) -> Dict[str, Any]:
@@ -76,12 +78,16 @@ async def read_frame(reader: StreamReader) -> Dict[str, Any]:
         try:
             body_text = body_bytes.decode("utf-8")
             message = json.loads(body_text)
-            return message
         except UnicodeDecodeError as e:
             raise InvalidMessageError(f"UTF-8 decode failed: {e}", e)
         except json.JSONDecodeError as e:
             raise InvalidMessageError(f"JSON parse failed: {e}", e)
-            
+        # Every command is a JSON object; a bare list or string would crash
+        # the handlers that call message.get(...).
+        if not isinstance(message, dict):
+            raise InvalidMessageError("Frame body must be a JSON object")
+        return message
+
     except asyncio.IncompleteReadError as e:
         # Client disconnected before sending complete frame
         raise DisconnectError(
@@ -95,6 +101,26 @@ async def read_frame(reader: StreamReader) -> Dict[str, Any]:
         if isinstance(e, (DisconnectError, FramingError, InvalidMessageError)):
             raise
         raise FramingError(f"Unexpected error reading frame: {e}", e)
+
+
+def encode_frame(data: Dict[str, Any]) -> bytes:
+    """
+    Serialize one message to wire bytes: 4-byte big-endian length + UTF-8 JSON.
+
+    A broadcast encodes once and writes the same bytes to every recipient,
+    instead of re-serializing the JSON per member.
+
+    Raises:
+        InvalidMessageError: not JSON-serializable, or larger than the frame limit
+    """
+    try:
+        body_bytes = json.dumps(data, separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError) as e:
+        raise InvalidMessageError(f"JSON serialization failed: {e}", e)
+    max_size = get_max_frame_size()
+    if len(body_bytes) > max_size:
+        raise InvalidMessageError(f"Message size {len(body_bytes)} exceeds maximum {max_size}")
+    return struct.pack(HEADER_FORMAT, len(body_bytes)) + body_bytes
 
 
 async def write_frame(writer: StreamWriter, data: Dict[str, Any]) -> None:
@@ -117,31 +143,11 @@ async def write_frame(writer: StreamWriter, data: Dict[str, Any]) -> None:
         InvalidMessageError: JSON serialization failed
         DisconnectError: Write failed (connection closed)
     """
+    frame = encode_frame(data)  # raises InvalidMessageError
     try:
-        # Step 1-2: Serialize to JSON and encode
-        body_text = json.dumps(data, separators=(",", ":"))  # Compact encoding
-        body_bytes = body_text.encode("utf-8")
-        
-        # Step 3: Calculate length
-        body_length = len(body_bytes)
-        
-        max_size = get_max_frame_size()
-        if body_length > max_size:
-            raise InvalidMessageError(
-                f"Message size {body_length} exceeds maximum {max_size}"
-            )
-        
-        # Step 4: Pack header
-        header_bytes = struct.pack(HEADER_FORMAT, body_length)
-        
-        # Step 5: Write frame (header + body)
-        writer.write(header_bytes + body_bytes)
-        
-        # Step 6: Drain buffer (critical for flow control)
+        # Write header + body, then drain (flow control)
+        writer.write(frame)
         await writer.drain()
-        
-    except (TypeError, ValueError) as e:
-        raise InvalidMessageError(f"JSON serialization failed: {e}", e)
     except ConnectionResetError as e:
         raise DisconnectError("Connection reset during write", e)
     except BrokenPipeError as e:

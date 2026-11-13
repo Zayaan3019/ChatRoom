@@ -1,71 +1,51 @@
 """
-Entry point for the production-grade async chat server.
+Entry point for the production chat server.
+
+    python main.py
+
+Configuration comes from CHAT_* environment variables (see .env.example).
 """
 import asyncio
 import logging
 import sys
 
-from app.server.enhanced_server import EnhancedChatServer
 from app.core.config import get_server_config
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('chat_server.log')
-    ]
-)
-
-logger = logging.getLogger(__name__)
+from app.server.enhanced_server import EnhancedChatServer
 
 
-async def main():
-    """
-    Start the production chat server.
-    
-    Features:
-        - Rate limiting and connection limits
-        - Metrics and health endpoints (port 9090)
-        - Input validation and sanitization
-        - Configuration via environment variables
-        - Graceful shutdown
-    """
-    config = get_server_config()
-    
-    logger.info("="*60)
-    logger.info(" PRODUCTION CHAT SERVER ".center(60, "="))
-    logger.info("="*60)
-    logger.info(f"Chat Port: {config.port}")
-    logger.info(f"Metrics Port: {config.metrics_port}")
-    logger.info(f"Max Connections: {config.max_connections}")
-    logger.info(f"Max Messages/Min: {config.max_messages_per_minute}")
-    logger.info(f"Rate Limit Enabled: {config.enable_rate_limiting}")
-    logger.info("="*60)
-    
-    # Create enhanced server
-    server = EnhancedChatServer(
-        host=config.host,
-        port=config.port
+def setup_logging(level: str, log_file: str = None) -> None:
+    handlers = [logging.StreamHandler(sys.stdout)]
+    if log_file:
+        handlers.append(logging.FileHandler(log_file))
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        handlers=handlers,
     )
-    
-    try:
-        await server.start()
-    except KeyboardInterrupt:
-        logger.info("Received shutdown signal")
-    except Exception as e:
-        logger.error(f"Server error: {e}", exc_info=True)
-        raise
-    finally:
-        logger.info("Server shutdown complete")
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
+
+
+async def main() -> None:
+    config = get_server_config()
+    setup_logging(config.log_level, config.log_file)
+    logger = logging.getLogger(__name__)
+    logger.info(
+        f"Chat port {config.port}, metrics port {config.metrics_port}, "
+        f"max connections {config.max_connections}, "
+        f"rate limiting {'on' if config.enable_rate_limiting else 'off'} "
+        f"({config.max_messages_per_minute}/min per user, "
+        f"{config.max_messages_per_minute_per_ip}/min per IP)"
+    )
+    await EnhancedChatServer(config=config).start()
 
 
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n👋 Server stopped")
+        print("Server stopped")
     except Exception as e:
-        print(f"❌ Fatal error: {e}")
+        print(f"Fatal error: {e}")
         sys.exit(1)

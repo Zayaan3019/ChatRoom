@@ -1,198 +1,213 @@
 """
 Rate Limiting - Token Bucket Algorithm
 Prevents abuse and ensures fair resource usage.
+
+Messages are limited per user AND per IP address. A message is allowed only
+when both buckets have a token, and then both are charged together, so a
+refusal from one never wastes the other's token. The per-IP bucket is what
+stops a client from multiplying its allowance by opening many connections or
+reconnecting under new usernames.
+
+The server is a single asyncio event loop and none of the bucket operations
+await, so each check is atomic without locks.
 """
-import asyncio
 import time
-from typing import Dict, Optional
-from collections import defaultdict
+from typing import Callable, Dict, Optional, Tuple
 
 
 class TokenBucket:
     """
-    Token bucket rate limiter.
-    
-    Algorithm:
-        - Tokens are added at a constant rate
-        - Each action consumes tokens
-        - If no tokens available, action is denied
+    Token bucket.
+
+    Tokens refill continuously at `rate` per second up to `burst`; each action
+    takes one. A full bucket is indistinguishable from a new one, which is
+    what lets idle buckets be dropped without changing behaviour.
     """
-    
-    def __init__(self, rate: float, burst: int) -> None:
-        """
-        Args:
-            rate: Tokens per second
-            burst: Maximum tokens (bucket capacity)
-        """
+
+    def __init__(self, rate: float, burst: int, clock: Callable[[], float] = time.monotonic) -> None:
+        if rate <= 0 or burst <= 0:
+            raise ValueError("rate and burst must be positive")
         self.rate = rate
         self.burst = burst
+        self._clock = clock
         self.tokens = float(burst)
-        self.last_update = time.monotonic()
-        self._lock = asyncio.Lock()
-    
+        self.last_update = clock()
+
+    def _refill(self) -> None:
+        now = self._clock()
+        elapsed = max(0.0, now - self.last_update)
+        self.tokens = min(float(self.burst), self.tokens + elapsed * self.rate)
+        self.last_update = now
+
+    def available(self) -> float:
+        """Tokens available right now."""
+        self._refill()
+        return self.tokens
+
+    def take(self, tokens: int = 1) -> None:
+        """Remove tokens; call only after available() showed enough."""
+        self.tokens -= tokens
+
+    def is_full(self) -> bool:
+        return self.available() >= self.burst
+
+    def try_consume(self, tokens: int = 1) -> bool:
+        if self.available() >= tokens:
+            self.take(tokens)
+            return True
+        return False
+
     async def consume(self, tokens: int = 1) -> bool:
-        """
-        Attempt to consume tokens.
-        
-        Returns:
-            True if tokens consumed, False if rate limited
-        """
-        async with self._lock:
-            now = time.monotonic()
-            elapsed = now - self.last_update
-            
-            # Add tokens based on time elapsed
-            self.tokens = min(self.burst, self.tokens + elapsed * self.rate)
-            self.last_update = now
-            
-            if self.tokens >= tokens:
-                self.tokens -= tokens
-                return True
-            else:
-                return False
-    
-    async def wait_for_token(self, tokens: int = 1, timeout: Optional[float] = None) -> bool:
-        """
-        Wait until tokens are available.
-        
-        Returns:
-            True if acquired, False if timeout
-        """
-        start = time.monotonic()
-        
-        while True:
-            if await self.consume(tokens):
-                return True
-            
-            if timeout and (time.monotonic() - start) >= timeout:
-                return False
-            
-            # Wait before retrying
-            await asyncio.sleep(0.1)
+        """Async-compatible wrapper kept for callers that await it."""
+        return self.try_consume(tokens)
+
+
+def _consume_all(buckets: Tuple[TokenBucket, ...], tokens: int = 1) -> bool:
+    """Charge every bucket, or none of them."""
+    if all(b.available() >= tokens for b in buckets):
+        for b in buckets:
+            b.take(tokens)
+        return True
+    return False
 
 
 class RateLimiter:
     """
-    Per-user rate limiter using token buckets.
-    
-    Tracks multiple rate limits per user:
-        - Messages per minute
-        - Joins per minute
-        - Commands per minute
+    Token-bucket limits per user and per IP.
+
+    Keys:
+        ("user", name, action)  - each user's own allowance
+        ("ip", address, action) - shared by every connection from one IP
     """
-    
+
+    PRUNE_EVERY = 1024  # checks between sweeps of idle (full) buckets
+
     def __init__(
         self,
         messages_per_minute: int = 60,
         joins_per_minute: int = 10,
-        burst: int = 10
+        burst: int = 10,
+        messages_per_minute_per_ip: Optional[int] = None,
+        joins_per_minute_per_ip: Optional[int] = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self.messages_rate = messages_per_minute / 60.0  # Convert to per-second
-        self.joins_rate = joins_per_minute / 60.0
         self.burst = burst
-        
-        # user_id -> action_type -> TokenBucket
-        self._buckets: Dict[str, Dict[str, TokenBucket]] = defaultdict(dict)
-        self._lock = asyncio.Lock()
-    
-    def _get_bucket(self, user_id: str, action: str) -> TokenBucket:
-        """Get or create token bucket for user and action."""
-        if action not in self._buckets[user_id]:
-            if action == "message":
-                rate = self.messages_rate
-            elif action == "join":
-                rate = self.joins_rate
-            else:
-                rate = 1.0  # Default rate
-            
-            self._buckets[user_id][action] = TokenBucket(rate, self.burst)
-        
-        return self._buckets[user_id][action]
-    
-    async def check_message(self, user_id: str) -> bool:
-        """Check if user can send a message."""
-        bucket = self._get_bucket(user_id, "message")
-        return await bucket.consume(1)
-    
-    async def check_join(self, user_id: str) -> bool:
-        """Check if user can join a room."""
-        bucket = self._get_bucket(user_id, "join")
-        return await bucket.consume(1)
-    
-    async def check_action(self, user_id: str, action: str) -> bool:
-        """Check if user can perform generic action."""
-        bucket = self._get_bucket(user_id, action)
-        return await bucket.consume(1)
-    
+        self._clock = clock
+        # Per-second rates for each (scope, action).
+        self._rates: Dict[Tuple[str, str], float] = {
+            ("user", "message"): messages_per_minute / 60.0,
+            ("user", "join"): joins_per_minute / 60.0,
+            ("ip", "message"): (messages_per_minute_per_ip or messages_per_minute * 5) / 60.0,
+            ("ip", "join"): (joins_per_minute_per_ip or joins_per_minute * 5) / 60.0,
+        }
+        # The IP bucket's burst scales with its rate, so a handful of users
+        # behind one NAT can each still send their own burst.
+        self._ip_burst_factor = max(
+            1.0, self._rates[("ip", "message")] / max(self._rates[("user", "message")], 1e-9)
+        )
+        self._buckets: Dict[Tuple[str, str, str], TokenBucket] = {}
+        self._checks = 0
+
+    # Kept for compatibility with code that reads these attributes.
+    @property
+    def messages_rate(self) -> float:
+        return self._rates[("user", "message")]
+
+    @property
+    def joins_rate(self) -> float:
+        return self._rates[("user", "join")]
+
+    def _bucket(self, scope: str, key: str, action: str) -> TokenBucket:
+        bucket_key = (scope, key, action)
+        bucket = self._buckets.get(bucket_key)
+        if bucket is None:
+            rate = self._rates.get((scope, action), 1.0)
+            burst = self.burst if scope == "user" else max(self.burst, round(self.burst * self._ip_burst_factor))
+            bucket = TokenBucket(rate, burst, self._clock)
+            self._buckets[bucket_key] = bucket
+        return bucket
+
+    def _check(self, action: str, user_id: str, ip_address: Optional[str]) -> bool:
+        self._checks += 1
+        if self._checks % self.PRUNE_EVERY == 0:
+            self.prune()
+        buckets = [self._bucket("user", user_id, action)]
+        if ip_address:
+            buckets.append(self._bucket("ip", ip_address, action))
+        return _consume_all(tuple(buckets))
+
+    async def check_message(self, user_id: str, ip_address: Optional[str] = None) -> bool:
+        """True if this user (and its IP) may send a message now."""
+        return self._check("message", user_id, ip_address)
+
+    async def check_join(self, user_id: str, ip_address: Optional[str] = None) -> bool:
+        """True if this user (and its IP) may join a room now."""
+        return self._check("join", user_id, ip_address)
+
+    async def check_action(self, user_id: str, action: str, ip_address: Optional[str] = None) -> bool:
+        return self._check(action, user_id, ip_address)
+
+    def prune(self) -> int:
+        """Drop buckets that have refilled completely. Lossless: a full bucket
+        behaves exactly like a new one. Returns how many were dropped."""
+        idle = [key for key, bucket in self._buckets.items() if bucket.is_full()]
+        for key in idle:
+            del self._buckets[key]
+        return len(idle)
+
     async def cleanup_user(self, user_id: str) -> None:
-        """Remove rate limit tracking for disconnected user."""
-        async with self._lock:
-            if user_id in self._buckets:
-                del self._buckets[user_id]
-    
+        """Kept for compatibility. A user's bucket is deliberately NOT reset on
+        disconnect -- reconnecting must not refill an allowance -- and is
+        removed by prune() once it has refilled on its own."""
+        return None
+
     def get_stats(self) -> Dict:
-        """Get rate limiter statistics."""
+        users = {key[1] for key in self._buckets if key[0] == "user"}
+        ips = {key[1] for key in self._buckets if key[0] == "ip"}
         return {
-            "tracked_users": len(self._buckets),
-            "messages_rate": self.messages_rate * 60,
-            "joins_rate": self.joins_rate * 60,
-            "burst": self.burst
+            "tracked_users": len(users),
+            "tracked_ips": len(ips),
+            "messages_rate": self._rates[("user", "message")] * 60,
+            "messages_rate_per_ip": self._rates[("ip", "message")] * 60,
+            "joins_rate": self._rates[("user", "join")] * 60,
+            "burst": self.burst,
         }
 
 
 class ConnectionLimiter:
     """
-    Limits concurrent connections globally and per-IP.
+    Limits concurrent connections globally and per IP.
     """
-    
-    def __init__(
-        self,
-        max_total: int = 10000,
-        max_per_ip: int = 100
-    ) -> None:
+
+    def __init__(self, max_total: int = 10000, max_per_ip: int = 100) -> None:
         self.max_total = max_total
         self.max_per_ip = max_per_ip
-        
         self.total_connections = 0
-        self._ip_connections: Dict[str, int] = defaultdict(int)
-        self._lock = asyncio.Lock()
-    
+        self._ip_connections: Dict[str, int] = {}
+
     async def acquire(self, ip_address: str) -> bool:
-        """
-        Attempt to acquire connection slot.
-        
-        Returns:
-            True if allowed, False if limit exceeded
-        """
-        async with self._lock:
-            # Check global limit
-            if self.total_connections >= self.max_total:
-                return False
-            
-            # Check per-IP limit
-            if self._ip_connections[ip_address] >= self.max_per_ip:
-                return False
-            
-            # Grant connection
-            self.total_connections += 1
-            self._ip_connections[ip_address] += 1
-            return True
-    
+        """Take a connection slot; False if a limit is reached."""
+        if self.total_connections >= self.max_total:
+            return False
+        if self._ip_connections.get(ip_address, 0) >= self.max_per_ip:
+            return False
+        self.total_connections += 1
+        self._ip_connections[ip_address] = self._ip_connections.get(ip_address, 0) + 1
+        return True
+
     async def release(self, ip_address: str) -> None:
-        """Release connection slot."""
-        async with self._lock:
-            self.total_connections = max(0, self.total_connections - 1)
-            self._ip_connections[ip_address] = max(0, self._ip_connections[ip_address] - 1)
-            
-            # Cleanup empty entries
-            if self._ip_connections[ip_address] == 0:
-                del self._ip_connections[ip_address]
-    
+        """Return a connection slot."""
+        self.total_connections = max(0, self.total_connections - 1)
+        remaining = self._ip_connections.get(ip_address, 0) - 1
+        if remaining > 0:
+            self._ip_connections[ip_address] = remaining
+        else:
+            self._ip_connections.pop(ip_address, None)
+
     def get_stats(self) -> Dict:
-        """Get connection statistics."""
         return {
             "total_connections": self.total_connections,
             "max_total": self.max_total,
             "max_per_ip": self.max_per_ip,
-            "ip_breakdown": dict(self._ip_connections)
+            "ip_breakdown": dict(self._ip_connections),
         }

@@ -1,279 +1,239 @@
 """
-Metrics and Observability - Prometheus-style Metrics
-Production-grade monitoring and alerting support.
+Metrics and Observability - Prometheus text exposition.
+
+Recording a message is O(1): the latency goes into a bounded ring buffer and a
+timestamp into a deque. Percentiles and rates are computed only when /metrics
+is scraped, not on every message.
 """
-import asyncio
+import math
 import time
-from typing import Dict, Optional, Set
-from collections import defaultdict
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Callable, Deque, Dict, Optional, Sequence
 
 
 @dataclass
 class Metrics:
-    """System-wide metrics collector."""
-    
-    # Connection metrics
+    """Point-in-time snapshot of the server's metrics."""
+
+    # Connections
     total_connections: int = 0
     active_connections: int = 0
     failed_connections: int = 0
     connections_rate: float = 0.0
-    
-    # Message metrics
+
+    # Messages
     total_messages: int = 0
     messages_per_second: float = 0.0
     failed_messages: int = 0
-    
-    # Room metrics
-    total_rooms: int = 0
+
+    # Rooms
     active_rooms: int = 0
-    
-    # Performance metrics
-    avg_message_latency_ms: float = 0.0
+
+    # Latency (handling time of a MSG command, ms), over the recent window
+    p50_message_latency_ms: float = 0.0
     p95_message_latency_ms: float = 0.0
     p99_message_latency_ms: float = 0.0
-    
-    # Rate limiting
+    avg_message_latency_ms: float = 0.0
+
+    # Rate limiting and errors
     rate_limited_requests: int = 0
-    
-    # Error metrics
     protocol_errors: int = 0
     timeout_errors: int = 0
     disconnect_errors: int = 0
-    
-    # Resource metrics
-    memory_usage_mb: float = 0.0
-    cpu_usage_percent: float = 0.0
-    
-    # Uptime
+    slow_client_disconnects: int = 0
+
     server_start_time: datetime = field(default_factory=datetime.now)
-    
+
     def uptime_seconds(self) -> float:
-        """Calculate server uptime."""
         return (datetime.now() - self.server_start_time).total_seconds()
+
+
+def percentile(sorted_values: Sequence[float], q: float) -> float:
+    """Nearest-rank percentile of already-sorted values (q in [0, 1])."""
+    if not sorted_values:
+        return 0.0
+    rank = max(1, math.ceil(q * len(sorted_values)))
+    return float(sorted_values[min(rank, len(sorted_values)) - 1])
 
 
 class MetricsCollector:
     """
-    Collects and aggregates metrics for monitoring.
-    Thread-safe for asyncio.
+    Collects server metrics. All methods run on the event loop and none of
+    them await internally, so updates are atomic without locks. They stay
+    `async` so existing callers can keep awaiting them.
     """
-    
-    def __init__(self) -> None:
+
+    LATENCY_SAMPLES = 10000  # ring buffer for percentiles
+    RATE_WINDOW_SECONDS = 60.0
+
+    def __init__(self, clock: Callable[[], float] = time.time) -> None:
+        self._clock = clock
         self.metrics = Metrics()
-        self._lock = asyncio.Lock()
-        
-        # Latency tracking (circular buffer)
-        self._latencies: list = []
-        self._max_latency_samples = 10000
-        
-        # Rate tracking
-        self._message_timestamps: list = []
-        self._connection_timestamps: list = []
-        self._window_size = 60.0  # 1 minute window
-        
-        # Per-room metrics
-        self._room_message_counts: Dict[str, int] = defaultdict(int)
-        self._room_user_counts: Dict[str, int] = defaultdict(int)
-    
+        self._latencies: Deque[float] = deque(maxlen=self.LATENCY_SAMPLES)
+        self._latency_sum_ms = 0.0  # all-time, for the summary's _sum
+        self._message_times: Deque[float] = deque()
+        self._connection_times: Deque[float] = deque()
+        self._room_message_counts: Dict[str, int] = {}
+        self._room_user_counts: Dict[str, int] = {}
+        # When set, the live room count comes from the room manager itself,
+        # which is the source of truth.
+        self._rooms_provider: Optional[Callable[[], int]] = None
+
+    # ---- recording -------------------------------------------------------
+
+    def set_rooms_provider(self, provider: Callable[[], int]) -> None:
+        self._rooms_provider = provider
+
     async def increment_connections(self) -> None:
-        """Record new connection."""
-        async with self._lock:
-            self.metrics.total_connections += 1
-            self.metrics.active_connections += 1
-            self._connection_timestamps.append(time.time())
-            await self._update_connection_rate()
-    
+        self.metrics.total_connections += 1
+        self.metrics.active_connections += 1
+        self._connection_times.append(self._clock())
+
     async def decrement_connections(self) -> None:
-        """Record connection close."""
-        async with self._lock:
-            self.metrics.active_connections = max(0, self.metrics.active_connections - 1)
-    
+        self.metrics.active_connections = max(0, self.metrics.active_connections - 1)
+
     async def increment_failed_connections(self) -> None:
-        """Record failed connection attempt."""
-        async with self._lock:
-            self.metrics.failed_connections += 1
-    
+        self.metrics.failed_connections += 1
+
     async def record_message(self, latency_ms: float) -> None:
-        """Record message sent with latency."""
-        async with self._lock:
-            self.metrics.total_messages += 1
-            self._message_timestamps.append(time.time())
-            
-            # Track latency
-            self._latencies.append(latency_ms)
-            if len(self._latencies) > self._max_latency_samples:
-                self._latencies.pop(0)
-            
-            # Update rates and percentiles
-            await self._update_message_rate()
-            await self._update_latency_percentiles()
-    
+        self.metrics.total_messages += 1
+        self._message_times.append(self._clock())
+        self._latencies.append(latency_ms)
+        self._latency_sum_ms += latency_ms
+
     async def increment_failed_messages(self) -> None:
-        """Record failed message."""
-        async with self._lock:
-            self.metrics.failed_messages += 1
-    
+        self.metrics.failed_messages += 1
+
     async def record_room_metrics(self, room_name: str, user_count: int) -> None:
-        """Update room statistics."""
-        async with self._lock:
+        """Record a room's member count after a join or leave. Empty rooms are
+        forgotten, so the gauge goes down and the map cannot grow forever."""
+        if user_count > 0:
             self._room_user_counts[room_name] = user_count
-            self.metrics.active_rooms = len([c for c in self._room_user_counts.values() if c > 0])
-    
+        else:
+            self._room_user_counts.pop(room_name, None)
+            self._room_message_counts.pop(room_name, None)
+        self.metrics.active_rooms = len(self._room_user_counts)
+
     async def increment_room_message(self, room_name: str) -> None:
-        """Record message in specific room."""
-        async with self._lock:
-            self._room_message_counts[room_name] += 1
-    
+        self._room_message_counts[room_name] = self._room_message_counts.get(room_name, 0) + 1
+
     async def increment_rate_limited(self) -> None:
-        """Record rate-limited request."""
-        async with self._lock:
-            self.metrics.rate_limited_requests += 1
-    
+        self.metrics.rate_limited_requests += 1
+
     async def increment_protocol_errors(self) -> None:
-        """Record protocol error."""
-        async with self._lock:
-            self.metrics.protocol_errors += 1
-    
+        self.metrics.protocol_errors += 1
+
     async def increment_timeout_errors(self) -> None:
-        """Record timeout error."""
-        async with self._lock:
-            self.metrics.timeout_errors += 1
-    
+        self.metrics.timeout_errors += 1
+
     async def increment_disconnect_errors(self) -> None:
-        """Record disconnect error."""
-        async with self._lock:
-            self.metrics.disconnect_errors += 1
-    
-    async def _update_connection_rate(self) -> None:
-        """Calculate connections per second."""
-        now = time.time()
-        cutoff = now - self._window_size
-        
-        # Remove old timestamps
-        self._connection_timestamps = [ts for ts in self._connection_timestamps if ts > cutoff]
-        
-        # Calculate rate
-        if self._connection_timestamps:
-            elapsed = now - self._connection_timestamps[0]
-            if elapsed > 0:
-                self.metrics.connections_rate = len(self._connection_timestamps) / elapsed
-    
-    async def _update_message_rate(self) -> None:
-        """Calculate messages per second."""
-        now = time.time()
-        cutoff = now - self._window_size
-        
-        # Remove old timestamps
-        self._message_timestamps = [ts for ts in self._message_timestamps if ts > cutoff]
-        
-        # Calculate rate
-        if self._message_timestamps:
-            elapsed = now - self._message_timestamps[0]
-            if elapsed > 0:
-                self.metrics.messages_per_second = len(self._message_timestamps) / elapsed
-    
-    async def _update_latency_percentiles(self) -> None:
-        """Calculate latency percentiles."""
-        if not self._latencies:
-            return
-        
-        sorted_latencies = sorted(self._latencies)
-        count = len(sorted_latencies)
-        
-        # Calculate percentiles
-        self.metrics.avg_message_latency_ms = sum(sorted_latencies) / count
-        
-        p95_idx = int(count * 0.95)
-        self.metrics.p95_message_latency_ms = sorted_latencies[min(p95_idx, count - 1)]
-        
-        p99_idx = int(count * 0.99)
-        self.metrics.p99_message_latency_ms = sorted_latencies[min(p99_idx, count - 1)]
-    
+        self.metrics.disconnect_errors += 1
+
+    async def increment_slow_client_disconnects(self) -> None:
+        self.metrics.slow_client_disconnects += 1
+
+    # ---- reading ---------------------------------------------------------
+
+    @staticmethod
+    def _rate(times: Deque[float], now: float, window: float) -> float:
+        while times and times[0] <= now - window:
+            times.popleft()
+        if not times:
+            return 0.0
+        # Divide by the full window once it has filled, so a single event
+        # does not read as an enormous instantaneous rate.
+        span = max(now - times[0], min(window, 1.0))
+        return len(times) / span
+
+    def _refresh(self) -> Metrics:
+        now = self._clock()
+        m = self.metrics
+        m.messages_per_second = self._rate(self._message_times, now, self.RATE_WINDOW_SECONDS)
+        m.connections_rate = self._rate(self._connection_times, now, self.RATE_WINDOW_SECONDS)
+        ordered = sorted(self._latencies)
+        m.p50_message_latency_ms = percentile(ordered, 0.50)
+        m.p95_message_latency_ms = percentile(ordered, 0.95)
+        m.p99_message_latency_ms = percentile(ordered, 0.99)
+        m.avg_message_latency_ms = (sum(ordered) / len(ordered)) if ordered else 0.0
+        if self._rooms_provider is not None:
+            m.active_rooms = self._rooms_provider()
+        return m
+
     async def get_metrics(self) -> Metrics:
-        """Get current metrics snapshot."""
-        async with self._lock:
-            return self.metrics
-    
+        return self._refresh()
+
     async def get_prometheus_format(self) -> str:
-        """
-        Export metrics in Prometheus text format.
-        
-        Returns:
-            Metrics in Prometheus exposition format
-        """
-        async with self._lock:
-            lines = [
-                "# HELP chat_connections_total Total number of connections",
-                "# TYPE chat_connections_total counter",
-                f"chat_connections_total {self.metrics.total_connections}",
-                "",
-                "# HELP chat_connections_active Currently active connections",
-                "# TYPE chat_connections_active gauge",
-                f"chat_connections_active {self.metrics.active_connections}",
-                "",
-                "# HELP chat_connections_failed_total Failed connection attempts",
-                "# TYPE chat_connections_failed_total counter",
-                f"chat_connections_failed_total {self.metrics.failed_connections}",
-                "",
-                "# HELP chat_messages_total Total messages sent",
-                "# TYPE chat_messages_total counter",
-                f"chat_messages_total {self.metrics.total_messages}",
-                "",
-                "# HELP chat_messages_per_second Current message rate",
-                "# TYPE chat_messages_per_second gauge",
-                f"chat_messages_per_second {self.metrics.messages_per_second:.2f}",
-                "",
-                "# HELP chat_message_latency_ms Message latency in milliseconds",
-                "# TYPE chat_message_latency_ms summary",
-                f"chat_message_latency_ms{{quantile=\"0.5\"}} {self.metrics.avg_message_latency_ms:.2f}",
-                f"chat_message_latency_ms{{quantile=\"0.95\"}} {self.metrics.p95_message_latency_ms:.2f}",
-                f"chat_message_latency_ms{{quantile=\"0.99\"}} {self.metrics.p99_message_latency_ms:.2f}",
-                "",
-                "# HELP chat_rooms_active Currently active rooms",
-                "# TYPE chat_rooms_active gauge",
-                f"chat_rooms_active {self.metrics.active_rooms}",
-                "",
-                "# HELP chat_rate_limited_requests_total Rate limited requests",
-                "# TYPE chat_rate_limited_requests_total counter",
-                f"chat_rate_limited_requests_total {self.metrics.rate_limited_requests}",
-                "",
-                "# HELP chat_errors_total Total errors by type",
-                "# TYPE chat_errors_total counter",
-                f"chat_errors_total{{type=\"protocol\"}} {self.metrics.protocol_errors}",
-                f"chat_errors_total{{type=\"timeout\"}} {self.metrics.timeout_errors}",
-                f"chat_errors_total{{type=\"disconnect\"}} {self.metrics.disconnect_errors}",
-                "",
-                "# HELP chat_uptime_seconds Server uptime in seconds",
-                "# TYPE chat_uptime_seconds counter",
-                f"chat_uptime_seconds {self.metrics.uptime_seconds():.0f}",
-                ""
-            ]
-            
-            return "\n".join(lines)
-    
+        m = self._refresh()
+
+        def block(name: str, kind: str, help_text: str, *samples: str) -> list:
+            return [f"# HELP {name} {help_text}", f"# TYPE {name} {kind}", *samples]
+
+        lines = []
+        lines += block("chat_connections_total", "counter", "Connections accepted.",
+                       f"chat_connections_total {m.total_connections}")
+        lines += block("chat_connections_active", "gauge", "Currently open connections.",
+                       f"chat_connections_active {m.active_connections}")
+        lines += block("chat_connections_failed_total", "counter", "Connections refused by limits.",
+                       f"chat_connections_failed_total {m.failed_connections}")
+        lines += block("chat_messages_total", "counter", "Chat messages broadcast.",
+                       f"chat_messages_total {m.total_messages}")
+        lines += block("chat_messages_failed_total", "counter", "Chat messages refused.",
+                       f"chat_messages_failed_total {m.failed_messages}")
+        lines += block("chat_messages_per_second", "gauge", "Message rate over the last minute.",
+                       f"chat_messages_per_second {m.messages_per_second:.3f}")
+        lines += block(
+            "chat_message_latency_ms", "summary",
+            "Time to handle a MSG command including the broadcast, in ms "
+            f"(quantiles over the last {self.LATENCY_SAMPLES} messages).",
+            f'chat_message_latency_ms{{quantile="0.5"}} {m.p50_message_latency_ms:.3f}',
+            f'chat_message_latency_ms{{quantile="0.95"}} {m.p95_message_latency_ms:.3f}',
+            f'chat_message_latency_ms{{quantile="0.99"}} {m.p99_message_latency_ms:.3f}',
+            f"chat_message_latency_ms_sum {self._latency_sum_ms:.3f}",
+            f"chat_message_latency_ms_count {m.total_messages}",
+        )
+        lines += block("chat_rooms_active", "gauge", "Rooms with at least one member.",
+                       f"chat_rooms_active {m.active_rooms}")
+        lines += block("chat_rate_limited_requests_total", "counter", "Requests refused by rate limits.",
+                       f"chat_rate_limited_requests_total {m.rate_limited_requests}")
+        lines += block(
+            "chat_errors_total", "counter", "Connection errors by type.",
+            f'chat_errors_total{{type="protocol"}} {m.protocol_errors}',
+            f'chat_errors_total{{type="timeout"}} {m.timeout_errors}',
+            f'chat_errors_total{{type="disconnect"}} {m.disconnect_errors}',
+            f'chat_errors_total{{type="slow_client"}} {m.slow_client_disconnects}',
+        )
+        lines += block("chat_uptime_seconds", "gauge", "Seconds since the server started.",
+                       f"chat_uptime_seconds {m.uptime_seconds():.0f}")
+        return "\n".join(lines) + "\n"
+
     async def get_room_stats(self) -> Dict:
-        """Get per-room statistics."""
-        async with self._lock:
-            return {
-                "rooms": {
-                    room: {
-                        "users": self._room_user_counts.get(room, 0),
-                        "messages": self._room_message_counts.get(room, 0)
-                    }
-                    for room in set(list(self._room_user_counts.keys()) + list(self._room_message_counts.keys()))
+        rooms = set(self._room_user_counts) | set(self._room_message_counts)
+        return {
+            "rooms": {
+                room: {
+                    "users": self._room_user_counts.get(room, 0),
+                    "messages": self._room_message_counts.get(room, 0),
                 }
+                for room in rooms
             }
+        }
 
 
-# Global metrics instance
 _metrics: Optional[MetricsCollector] = None
 
 
 def get_metrics() -> MetricsCollector:
-    """Get global metrics collector."""
+    """Process-wide metrics collector."""
     global _metrics
     if _metrics is None:
         _metrics = MetricsCollector()
+    return _metrics
+
+
+def reset_metrics() -> MetricsCollector:
+    """Fresh collector (servers and tests that need isolated counters)."""
+    global _metrics
+    _metrics = MetricsCollector()
     return _metrics

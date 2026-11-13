@@ -66,24 +66,18 @@ class TestProtocol:
         """Test round-trip frame encoding/decoding."""
         # Create in-memory streams
         reader_stream = asyncio.StreamReader()
-        writer_stream = asyncio.StreamWriter(
-            transport=None,
-            protocol=None,
-            reader=None,
-            loop=asyncio.get_event_loop()
-        )
-        
-        # Mock the write/drain methods
         written_data = bytearray()
-        
-        def mock_write(data):
-            written_data.extend(data)
-        
-        async def mock_drain():
-            pass
-        
-        writer_stream.write = mock_write
-        writer_stream.drain = mock_drain
+
+        class MemoryWriter:
+            """Just the two methods write_frame uses."""
+
+            def write(self, data):
+                written_data.extend(data)
+
+            async def drain(self):
+                pass
+
+        writer_stream = MemoryWriter()
         
         # Test data
         test_message = {
@@ -307,10 +301,11 @@ class TestIntegration:
         await write_frame(writer2, {"type": "JOIN", "room": "test"})
         await read_frame(reader2)  # JOINED
         
-        # Bob should receive USER_JOINED notification
-        notification = await asyncio.wait_for(read_frame(reader2), timeout=1.0)
+        # Alice was already in the room, so SHE is told that Bob joined.
+        # (Bob joined second; nobody announces Alice to him.)
+        notification = await asyncio.wait_for(read_frame(reader1), timeout=1.0)
         assert notification["type"] == "USER_JOINED"
-        assert notification["username"] == "alice"
+        assert notification["username"] == "bob"
         
         # Alice sends message
         await write_frame(writer1, {

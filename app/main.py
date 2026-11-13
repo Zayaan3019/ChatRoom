@@ -8,7 +8,7 @@ import sys
 import argparse
 from typing import NoReturn
 
-from app.server.server import run_server
+from app.server.enhanced_server import run_server
 from app.client.client import run_client
 
 
@@ -68,8 +68,8 @@ Examples:
     parser.add_argument(
         "--port",
         type=int,
-        default=8888,
-        help="Port number (default: 8888)"
+        default=None,
+        help="Port number (default: CHAT_PORT or 8888)"
     )
     
     parser.add_argument(
@@ -91,14 +91,16 @@ async def main_async() -> None:
     
     try:
         if args.mode == "server":
-            host = args.host or "0.0.0.0"
-            logger.info(f"Starting server mode on {host}:{args.port}")
-            await run_server(host, args.port)
+            # Same production server as `python main.py`; --host/--port
+            # override the CHAT_HOST/CHAT_PORT environment settings.
+            logger.info("Starting server mode")
+            await run_server(args.host, args.port)
             
         elif args.mode == "client":
             host = args.host or "127.0.0.1"
-            logger.info(f"Starting client mode, connecting to {host}:{args.port}")
-            await run_client(host, args.port)
+            port = args.port or 8888
+            logger.info(f"Starting client mode, connecting to {host}:{port}")
+            await run_client(host, port)
             
     except KeyboardInterrupt:
         logger.info("Shutting down...")

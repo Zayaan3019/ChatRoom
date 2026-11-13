@@ -9,6 +9,7 @@ from typing import Optional, Set
 from asyncio import StreamReader, StreamWriter
 
 from .connection import ClientConnection
+from .enhanced_server import listen_options
 from .room_manager import RoomManager
 
 logger = logging.getLogger(__name__)
@@ -16,15 +17,15 @@ logger = logging.getLogger(__name__)
 
 class ChatServer:
     """
-    High-Performance Async TCP Chat Server.
-    
+    Minimal async TCP chat server: the protocol, rooms and authentication,
+    with no rate limiting and no metrics endpoint. It is the core the
+    integration tests drive directly. Deployments (`python main.py`,
+    `python -m app.main server`, the Docker image) run EnhancedChatServer.
+
     Architecture:
         - Single-threaded asyncio event loop
         - Each connection is a coroutine (lightweight)
         - Non-blocking I/O for all operations
-        
-    Capacity:
-        Designed to handle 1,000+ concurrent connections
     """
     
     def __init__(self, host: str = "0.0.0.0", port: int = 8888) -> None:
@@ -49,11 +50,7 @@ class ChatServer:
         
         # Start TCP server
         self.server = await asyncio.start_server(
-            self._handle_client,
-            self.host,
-            self.port,
-            reuse_address=True,  # Allow quick restart
-            reuse_port=True,     # Linux SO_REUSEPORT for load balancing
+            self._handle_client, self.host, self.port, **listen_options()
         )
         
         addrs = ", ".join(str(sock.getsockname()) for sock in self.server.sockets)

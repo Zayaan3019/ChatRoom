@@ -2,7 +2,9 @@
 Input Validation and Sanitization
 Prevents injection attacks and ensures data integrity.
 """
+import html
 import re
+import unicodedata
 from typing import Optional, Tuple
 
 
@@ -26,14 +28,61 @@ class InputValidator:
     USERNAME_PATTERN = re.compile(r'^[a-zA-Z0-9_-]+$')
     ROOM_NAME_PATTERN = re.compile(r'^[a-zA-Z0-9_-]+$')
     
-    # Blacklisted patterns (command injection, etc.)
+    # Markup that can execute script when a client renders messages as HTML.
+    # Matched against a normalised copy of the text (see _normalise_for_scan),
+    # so encodings like "&#x3C;script" or "java\tscript:" cannot slip past,
+    # while ordinary prose ("money = 5", "x < y") is left alone.
     DANGEROUS_PATTERNS = [
-        re.compile(r'<script', re.IGNORECASE),
-        re.compile(r'javascript:', re.IGNORECASE),
-        re.compile(r'on\w+\s*=', re.IGNORECASE),  # Event handlers
-        re.compile(r'\x00'),  # Null bytes
+        # Tags that run or load active content.
+        re.compile(
+            r"<\s*/?\s*(script|iframe|frame|object|embed|applet|base|meta|link|style|svg|math|form)\b",
+            re.IGNORECASE,
+        ),
+        # An event-handler attribute inside a tag: <img src=x onerror=...>.
+        re.compile(r"""<[^>]*[\s/"'](on[a-z]+)\s*=""", re.IGNORECASE),
+        # Script-capable URL schemes. Also matched with all whitespace removed,
+        # so "java script:" is caught too.
+        re.compile(r"(javascript|vbscript|livescript)\s*:", re.IGNORECASE),
+        re.compile(r"data\s*:\s*text/html", re.IGNORECASE),
+        # CSS expression() (legacy IE script execution).
+        re.compile(r"expression\s*\(", re.IGNORECASE),
     ]
-    
+    _SCHEME_PATTERNS = DANGEROUS_PATTERNS[2:4]
+
+    @staticmethod
+    def _normalise_for_scan(text: str) -> str:
+        """The text as a browser might interpret it, for pattern matching only.
+
+        - decode HTML entities repeatedly ("&amp;lt;" -> "&lt;" -> "<")
+        - Unicode NFKC, so a full-width "<" (U+FF1C) becomes "<"
+        - drop control and zero-width characters browsers ignore inside URLs
+        """
+        previous = None
+        for _ in range(3):
+            if text == previous:
+                break
+            previous, text = text, html.unescape(text)
+        text = unicodedata.normalize("NFKC", text)
+        keep = {"\n", "\t", " "}
+        return "".join(
+            ch for ch in text if ch in keep or unicodedata.category(ch) not in {"Cc", "Cf"}
+        )
+
+    @classmethod
+    def contains_dangerous_markup(cls, text: str) -> bool:
+        """True if the text carries markup or a URL scheme that can run script."""
+        scanned = cls._normalise_for_scan(text)
+        if any(p.search(scanned) for p in cls.DANGEROUS_PATTERNS):
+            return True
+        squeezed = re.sub(r"\s+", "", scanned)
+        return any(p.search(squeezed) for p in cls._SCHEME_PATTERNS)
+
+    @staticmethod
+    def escape_html(text: str) -> str:
+        """Escape for display in an HTML client. The protocol carries raw text;
+        any client that renders HTML must still escape on output."""
+        return html.escape(text, quote=True)
+
     @staticmethod
     def validate_username(username: str, max_length: int = 50) -> Tuple[bool, Optional[str]]:
         """
@@ -100,10 +149,10 @@ class InputValidator:
         if len(text) > max_length:
             return False, f"Message too long (max {max_length} characters)"
         
-        # Check for dangerous patterns
-        for pattern in InputValidator.DANGEROUS_PATTERNS:
-            if pattern.search(text):
-                return False, "Message contains forbidden content"
+        if '\x00' in text:
+            return False, "Message contains forbidden content"
+        if InputValidator.contains_dangerous_markup(text):
+            return False, "Message contains forbidden content"
         
         return True, None
     
