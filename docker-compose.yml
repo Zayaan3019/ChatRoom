@@ -1,86 +1,79 @@
-version: '3.8'
+# Two chat servers behind an Nginx TCP load balancer, with Prometheus and Grafana.
+#
+#   docker compose up --build
+#
+#   chat (TCP)   localhost:8888   -> nginx -> chat-server-1 / chat-server-2
+#   health       http://localhost/health   (nginx -> a server's :9090)
+#   Prometheus   http://localhost:9090
+#   Grafana      http://localhost:3000     (admin / $GRAFANA_ADMIN_PASSWORD, default "admin";
+#                                           host port $GRAFANA_PORT, default 3000)
+#
+# Settings: put CHAT_* overrides in a .env file next to this one (copy
+# .env.example). Compose reads it for the ${...} substitutions below; the file
+# is optional.
+#
+# Note: each server keeps its own rooms. Two users connected through nginx to
+# different servers are not in the same room (no cross-server backplane).
+
+x-chat-server: &chat-server
+  build: .
+  restart: unless-stopped
+  networks: [chat-network]
+  environment:
+    CHAT_HOST: 0.0.0.0
+    CHAT_PORT: 8888
+    CHAT_METRICS_PORT: 9090
+    CHAT_MAX_CONNECTIONS: ${CHAT_MAX_CONNECTIONS:-10000}
+    CHAT_MAX_CONNECTIONS_PER_IP: ${CHAT_MAX_CONNECTIONS_PER_IP:-100}
+    CHAT_ENABLE_RATE_LIMITING: ${CHAT_ENABLE_RATE_LIMITING:-true}
+    CHAT_MAX_MESSAGES_PER_MINUTE: ${CHAT_MAX_MESSAGES_PER_MINUTE:-60}
+    CHAT_MAX_MESSAGES_PER_MINUTE_PER_IP: ${CHAT_MAX_MESSAGES_PER_MINUTE_PER_IP:-300}
+    CHAT_LOG_LEVEL: ${CHAT_LOG_LEVEL:-INFO}
+  # Only nginx publishes the chat port; the servers' metrics ports are
+  # published on 9091/9092 for debugging.
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9090/health', timeout=4)"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 5s
 
 services:
-  # Chat Server Instance 1
   chat-server-1:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *chat-server
     container_name: chat-server-1
     ports:
-      - "8888:8888"
       - "9091:9090"
-    environment:
-      - CHAT_SERVER_HOST=0.0.0.0
-      - CHAT_SERVER_PORT=8888
-      - CHAT_METRICS_PORT=9090
-      - CHAT_MAX_CONNECTIONS=10000
-      - CHAT_MAX_MESSAGES_PER_MINUTE=60
-      - CHAT_ENABLE_RATE_LIMITING=true
-    env_file:
-      - .env
-    restart: unless-stopped
-    networks:
-      - chat-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
 
-  # Chat Server Instance 2
   chat-server-2:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *chat-server
     container_name: chat-server-2
     ports:
-      - "8889:8888"
       - "9092:9090"
-    environment:
-      - CHAT_SERVER_HOST=0.0.0.0
-      - CHAT_SERVER_PORT=8888
-      - CHAT_METRICS_PORT=9090
-      - CHAT_MAX_CONNECTIONS=10000
-      - CHAT_MAX_MESSAGES_PER_MINUTE=60
-      - CHAT_ENABLE_RATE_LIMITING=true
-    env_file:
-      - .env
-    restart: unless-stopped
-    networks:
-      - chat-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9090/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
 
-  # Nginx Load Balancer
   nginx:
-    image: nginx:alpine
+    image: nginx:1.27-alpine
     container_name: chat-nginx
     ports:
       - "80:80"
-      - "8888:8888"  # TCP load balancing for chat
+      - "8888:8888"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
-      - chat-server-1
-      - chat-server-2
+      chat-server-1:
+        condition: service_healthy
+      chat-server-2:
+        condition: service_healthy
     restart: unless-stopped
-    networks:
-      - chat-network
+    networks: [chat-network]
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
-      interval: 30s
-      timeout: 10s
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/health"]
+      interval: 15s
+      timeout: 5s
       retries: 3
 
-  # Prometheus for Metrics Collection
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v2.53.0
     container_name: chat-prometheus
     ports:
       - "9090:9090"
@@ -88,54 +81,45 @@ services:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
     command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-      - '--storage.tsdb.retention.time=30d'
-      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
-      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
     restart: unless-stopped
-    networks:
-      - chat-network
+    networks: [chat-network]
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
-      interval: 30s
-      timeout: 10s
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
       retries: 3
 
-  # Grafana for Dashboards
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:11.1.0
     container_name: chat-grafana
     ports:
-      - "3000:3000"
+      - "${GRAFANA_PORT:-3000}:3000"
     environment:
-      - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_USERS_ALLOW_SIGN_UP=false
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
     volumes:
       - grafana-data:/var/lib/grafana
-      - ./grafana-dashboards:/etc/grafana/provisioning/dashboards:ro
       - ./grafana-datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml:ro
+      - ./grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/dashboards.yml:ro
+      - ./grafana/chat-server.json:/var/lib/grafana/dashboards/chat-server.json:ro
     depends_on:
       - prometheus
     restart: unless-stopped
-    networks:
-      - chat-network
+    networks: [chat-network]
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
-      interval: 30s
-      timeout: 10s
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:3000/api/health"]
+      interval: 15s
+      timeout: 5s
       retries: 3
 
 networks:
   chat-network:
     driver: bridge
-    ipam:
-      config:
-        - subnet: 172.25.0.0/16
 
 volumes:
   prometheus-data:
-    driver: local
   grafana-data:
-    driver: local

@@ -1,0 +1,74 @@
+{
+  "uid": "chat-server",
+  "title": "Chat Server",
+  "tags": ["chat"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(chat_connections_active, instance)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Active connections",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "refId": "A", "expr": "sum(chat_connections_active{instance=~\"$instance\"})" }]
+    },
+    {
+      "id": 2, "type": "stat", "title": "Active rooms",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "refId": "A", "expr": "sum(chat_rooms_active{instance=~\"$instance\"})" }]
+    },
+    {
+      "id": 3, "type": "stat", "title": "Messages / s",
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "refId": "A", "expr": "sum(rate(chat_messages_total{instance=~\"$instance\"}[1m]))" }]
+    },
+    {
+      "id": 4, "type": "stat", "title": "Rate-limited requests / s",
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
+      "targets": [{ "refId": "A", "expr": "sum(rate(chat_rate_limited_requests_total{instance=~\"$instance\"}[5m]))" }]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Message handling latency (ms)",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "fieldConfig": { "defaults": { "unit": "ms" }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "max(chat_message_latency_ms{instance=~\"$instance\", quantile=\"0.5\"})", "legendFormat": "p50" },
+        { "refId": "B", "expr": "max(chat_message_latency_ms{instance=~\"$instance\", quantile=\"0.95\"})", "legendFormat": "p95" },
+        { "refId": "C", "expr": "max(chat_message_latency_ms{instance=~\"$instance\", quantile=\"0.99\"})", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Connections by server",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "targets": [{ "refId": "A", "expr": "chat_connections_active{instance=~\"$instance\"}", "legendFormat": "{{instance}}" }]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "Errors / s by type",
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+      "targets": [{ "refId": "A", "expr": "sum by (type) (rate(chat_errors_total{instance=~\"$instance\"}[5m]))", "legendFormat": "{{type}}" }]
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "Refused: connections and messages / s",
+      "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(chat_connections_failed_total{instance=~\"$instance\"}[5m]))", "legendFormat": "connections refused" },
+        { "refId": "B", "expr": "sum(rate(chat_messages_failed_total{instance=~\"$instance\"}[5m]))", "legendFormat": "messages refused" }
+      ]
+    }
+  ]
+}

@@ -51,10 +51,10 @@ Thumbs.db
 *.log
 logs/
 
-# Docker
-.dockerignore
-
 # MyPy
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+# Local settings (copy .env.example)
+.env

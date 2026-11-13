@@ -1,45 +1,18 @@
+# Scrapes both chat servers' /metrics (port 9090 inside the compose network).
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
-  external_labels:
-    monitor: 'chat-server-monitor'
 
-# Alerting configuration (optional)
-alerting:
-  alertmanagers:
-    - static_configs:
-        - targets: []
-
-# Load rules once and periodically evaluate them
-rule_files:
-  # - "alerts.yml"
-
-# Scrape configurations
 scrape_configs:
-  # Chat Server Instances
-  - job_name: 'chat-server'
-    static_configs:
-      - targets:
-          - 'chat-server-1:9090'
-          - 'chat-server-2:9090'
-        labels:
-          service: 'chat-server'
-    metrics_path: '/metrics'
+  - job_name: chat-server
+    metrics_path: /metrics
     scrape_interval: 10s
     scrape_timeout: 5s
-
-  # Prometheus self-monitoring
-  - job_name: 'prometheus'
     static_configs:
-      - targets:
-          - 'localhost:9090'
+      - targets: ["chat-server-1:9090", "chat-server-2:9090"]
         labels:
-          service: 'prometheus'
+          service: chat-server
 
-  # Node Exporter (if installed)
-  - job_name: 'node'
+  - job_name: prometheus
     static_configs:
-      - targets:
-          - 'node-exporter:9100'
-        labels:
-          service: 'node-exporter'
+      - targets: ["localhost:9090"]

@@ -1,597 +1,140 @@
-# 🏗️ Architecture Deep Dive
+# Architecture
 
-## System Overview
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         CLIENT LAYER                            │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐         │
-│  │  Client #1   │  │  Client #2   │  │  Client #N   │         │
-│  │   (Alice)    │  │    (Bob)     │  │  (Charlie)   │         │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘         │
-│         │                 │                  │                  │
-│         └─────────────────┴──────────────────┘                  │
-│                           │                                     │
-│                    TCP Connections                              │
-│                    (Binary Protocol)                            │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                         SERVER LAYER                            │
-│  ┌───────────────────────────────────────────────────────────┐ │
-│  │              AsyncIO Event Loop (Single Thread)           │ │
-│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐      │ │
-│  │  │   Task 1    │  │   Task 2    │  │   Task N    │      │ │
-│  │  │ Connection  │  │ Connection  │  │ Connection  │      │ │
-│  │  │   Handler   │  │   Handler   │  │   Handler   │      │ │
-│  │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘      │ │
-│  └─────────┼─────────────────┼─────────────────┼────────────┘ │
-│            │                 │                 │               │
-│            └─────────────────┴─────────────────┘               │
-│                              │                                  │
-│                              ▼                                  │
-│  ┌───────────────────────────────────────────────────────────┐ │
-│  │                   Room Manager (Pub/Sub)                  │ │
-│  │  ┌────────────┐  ┌────────────┐  ┌────────────┐         │ │
-│  │  │  "general" │  │   "tech"   │  │   "lobby"  │         │ │
-│  │  │  {alice,   │  │  {bob,     │  │ {charlie}  │         │ │
-│  │  │   bob}     │  │  charlie}  │  │            │         │ │
-│  │  └────────────┘  └────────────┘  └────────────┘         │ │
-│  └───────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-## Layer Breakdown
-
-### 1. Binary Protocol Layer (`app/core/protocol.py`)
-
-**Responsibility:** Solve TCP stream fragmentation
-
-**Problem:**
-```
-TCP is a stream, not a message protocol:
-  Send: "Hello"
-  Send: "World"
-  Receive: "HelloWorld" or "Hel" + "loWorld" (unpredictable!)
-```
-
-**Solution: Length-Prefixed Framing**
-```python
-# Wire format:
-[4 bytes: Length N] [N bytes: JSON Payload]
-
-# Example:
-Header: 0x00 0x00 0x00 0x1E (30 bytes)
-Body: {"type":"MSG","text":"Hi"}  (30 bytes UTF-8)
-```
-
-**Key Functions:**
-
-```python
-async def read_frame(reader: StreamReader) -> Dict[str, Any]:
-    """
-    Algorithm:
-      1. Read exactly 4 bytes (header)
-      2. Unpack as uint32 (big-endian)
-      3. Read exactly N bytes (body)
-      4. Decode UTF-8 and parse JSON
-    
-    Handles:
-      - Incomplete reads (client disconnect)
-      - Oversized frames (DoS protection)
-      - Invalid JSON (malformed data)
-    """
-    header_bytes = await reader.readexactly(4)
-    (body_length,) = struct.unpack("!I", header_bytes)
-    
-    if body_length > MAX_FRAME_SIZE:
-        raise FramingError("Frame too large")
-    
-    body_bytes = await reader.readexactly(body_length)
-    return json.loads(body_bytes.decode("utf-8"))
-
-
-async def write_frame(writer: StreamWriter, data: Dict[str, Any]) -> None:
-    """
-    Algorithm:
-      1. Serialize dict to JSON
-      2. Encode as UTF-8
-      3. Calculate length N
-      4. Pack N as 4-byte header
-      5. Write header + body
-      6. Drain buffer (critical!)
-    """
-    body_bytes = json.dumps(data).encode("utf-8")
-    header_bytes = struct.pack("!I", len(body_bytes))
-    
-    writer.write(header_bytes + body_bytes)
-    await writer.drain()  # Flush to network
-```
-
-**Performance:**
-- **Parsing:** O(1) - fixed header size
-- **Memory:** Pre-allocated buffers
-- **Throughput:** 50,000 msg/s on single core
-
----
-
-### 2. Room Manager (`app/server/room_manager.py`)
-
-**Responsibility:** Pub/Sub message routing
-
-**Data Structures:**
-
-```python
-class RoomManager:
-    # Primary index: room -> subscribers
-    _rooms: Dict[str, Set[ClientConnection]] = {
-        "general": {connection_alice, connection_bob},
-        "tech": {connection_bob, connection_charlie}
-    }
-    
-    # Reverse index: connection -> rooms (for cleanup)
-    _user_rooms: Dict[ClientConnection, Set[str]] = {
-        connection_alice: {"general"},
-        connection_bob: {"general", "tech"},
-        connection_charlie: {"tech"}
-    }
-```
-
-**Operations:**
-
-| Operation | Time Complexity | Space Complexity |
-|-----------|-----------------|------------------|
-| `join(room, conn)` | O(1) | O(1) |
-| `leave(room, conn)` | O(1) | O(1) |
-| `broadcast(room, msg)` | O(N) where N = members | O(1) |
-| `leave_all(conn)` | O(R) where R = rooms | O(1) |
-
-**Broadcast Algorithm:**
-
-```python
-async def broadcast(room: str, sender: Connection, message: Dict) -> int:
-    """
-    Steps:
-      1. Get subscribers (snapshot to avoid race)
-      2. Filter out sender (optional)
-      3. Send to all concurrently (asyncio.gather)
-      4. Handle failures gracefully
-    """
-    recipients = self._rooms[room].copy()  # Snapshot
-    recipients.discard(sender)  # Don't echo to sender
-    
-    # Send concurrently (non-blocking)
-    tasks = [conn.send(message) for conn in recipients]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    return sum(1 for r in results if r is True)
-```
-
-**Memory Management:**
-- Empty rooms auto-deleted
-- Weak references prevent leaks
-- Cleanup on disconnect
-
----
-
-### 3. Connection Handler (`app/server/connection.py`)
-
-**Responsibility:** Per-client state machine
-
-**Lifecycle:**
+## Layers
 
 ```
-   ┌─────────────┐
-   │   CONNECT   │
-   └──────┬──────┘
-          │
-          ▼
-   ┌─────────────┐
-   │    AUTH     │ ◄─── Must send username
-   └──────┬──────┘
-          │
-          ▼
-   ┌─────────────┐
-   │   ACTIVE    │ ◄─── JOIN, MSG, LEAVE, STATS
-   │   (Loop)    │
-   └──────┬──────┘
-          │
-          ▼
-   ┌─────────────┐
-   │  DISCONNECT │ ◄─── QUIT or connection lost
-   └─────────────┘
+ client ──TCP──> [ nginx stream LB ] ──> chat server process (one per core)
+                                          │
+   framing      app/core/protocol.py      │  4-byte length + JSON object
+   connection   app/server/connection.py  │  one per client: auth, commands, send, cleanup
+   rooms        app/server/room_manager.py│  room -> set of connections; username registry
+   policy       rate_limiter / validation │  token buckets, input rules
+   telemetry    app/core/metrics.py       │  counters + latency window -> :9090/metrics
 ```
 
-**Message Loop:**
+Each server process is one asyncio event loop. Every client is one coroutine
+(`ClientConnection.handle`) that reads a frame, processes it and waits for the
+next. Waiting on a socket costs no thread, so thousands of idle clients cost
+only memory. The measurement is 7.8 KiB per connection (`bench/RESULTS.md`).
 
-```python
-async def handle(self) -> None:
-    """
-    Main loop:
-      1. Authenticate (first message)
-      2. Loop: read_frame -> process -> respond
-      3. Cleanup on exit
-    """
-    await self._authenticate()
-    
-    while not self._closed:
-        frame = await read_frame(self.reader)
-        await self._process_message(frame)
-    
-    await self.close()
+## Framing
 
+TCP delivers a byte stream, not messages. Every message is
+`[uint32 big-endian length][UTF-8 JSON object]`. The reader:
+1. does `readexactly(4)` for the length;
+2. rejects the frame if the length is 0 or larger than `max_frame_size`, before allocating anything;
+3. does `readexactly(length)`, then parses.
 
-async def _process_message(self, frame: Dict) -> None:
-    """Command router."""
-    handlers = {
-        "JOIN": self._handle_join,
-        "MSG": self._handle_message,
-        "LEAVE": self._handle_leave,
-        "QUIT": self._handle_quit
-    }
-    
-    handler = handlers.get(frame["type"])
-    if handler:
-        await handler(frame)
-    else:
-        await self.send_error("Unknown command")
-```
+A peer that closes cleanly between frames counts as a normal disconnect. A
+peer that closes in the middle of a frame counts as a disconnect error.
 
-**Error Handling:**
+`encode_frame()` builds the wire bytes once. A broadcast reuses those bytes
+for every member.
 
-```python
-try:
-    await self.handle()
-except DisconnectError:
-    logger.info(f"Client {self.username} disconnected")
-except ProtocolError as e:
-    logger.error(f"Protocol violation: {e}")
-    await self.send_error(str(e))
-finally:
-    await self.close()  # Always cleanup
-```
+## Rooms (pub/sub)
 
----
+`RoomManager` keeps three dicts:
+- `room -> set(connection)`;
+- `connection -> set(room)`;
+- `casefolded username -> connection`.
 
-### 4. Server (`app/server/server.py`)
+Join and leave are set operations, O(1) on average. An empty room is deleted
+at once, so the room count and gauge go down as well as up.
 
-**Responsibility:** Accept loop + lifecycle management
-
-**Startup Sequence:**
-
-```python
-async def start(self) -> None:
-    """
-    1. Bind to port
-    2. Register signal handlers (SIGTERM, SIGINT)
-    3. Start accepting connections
-    4. Wait for shutdown signal
-    """
-    self.server = await asyncio.start_server(
-        self._handle_client,
-        self.host,
-        self.port,
-        reuse_address=True
-    )
-    
-    await self._shutdown_event.wait()
-```
-
-**Accept Loop:**
-
-```python
-async def _handle_client(self, reader: StreamReader, writer: StreamWriter) -> None:
-    """
-    Called for each new connection:
-      1. Wrap in ClientConnection
-      2. Spawn handler task
-      3. Track for graceful shutdown
-    """
-    connection = ClientConnection(reader, writer, self.room_manager, addr)
-    
-    task = asyncio.create_task(connection.handle())
-    self._connection_tasks.add(task)
-    
-    task.add_done_callback(self._connection_tasks.discard)
-```
-
-**Graceful Shutdown:**
-
-```python
-async def _shutdown(self, signal: Signals) -> None:
-    """
-    1. Stop accepting new connections
-    2. Wait for existing connections (10s timeout)
-    3. Force close remaining
-    """
-    self.server.close()
-    await self.server.wait_closed()
-    
-    # Give clients 10s to finish
-    try:
-        await asyncio.wait_for(
-            asyncio.gather(*self._connection_tasks),
-            timeout=10.0
-        )
-    except asyncio.TimeoutError:
-        # Force cancel
-        for task in self._connection_tasks:
-            task.cancel()
-```
-
----
-
-### 5. Client (`app/client/client.py`)
-
-**Responsibility:** Dual async loops (input + receive)
-
-**Concurrency Model:**
-
-```python
-async def run(self) -> None:
-    """
-    Run two concurrent tasks:
-      1. input_loop: Read user typing
-      2. receive_loop: Read server messages
-    
-    Both run until disconnect.
-    """
-    await asyncio.gather(
-        self._input_loop(),
-        self._receive_loop()
-    )
-```
-
-**Input Loop (Non-Blocking):**
-
-```python
-async def _input_loop(self) -> None:
-    """
-    Problem: input() blocks the event loop
-    Solution: Run in executor (thread pool)
-    """
-    while self._running:
-        line = await loop.run_in_executor(None, input, "> ")
-        await self._process_input(line)
-```
-
-**Receive Loop:**
-
-```python
-async def _receive_loop(self) -> None:
-    """
-    Continuously read server messages.
-    """
-    while self._running:
-        message = await read_frame(self.reader)
-        self._display_message(message)
-```
-
----
-
-## Asyncio Deep Dive
-
-### Event Loop Architecture
+### Broadcast
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│                    Event Loop (Single Thread)              │
-├────────────────────────────────────────────────────────────┤
-│  ┌──────────────────────────────────────────────────────┐ │
-│  │               Ready Queue (Runnable)                 │ │
-│  │  [Task A] [Task B] [Task C] ...                      │ │
-│  └──────────────────────────────────────────────────────┘ │
-│                           │                                │
-│                           ▼                                │
-│  ┌──────────────────────────────────────────────────────┐ │
-│  │          I/O Selector (epoll/kqueue/IOCP)            │ │
-│  │  Socket 1: Read Ready                                │ │
-│  │  Socket 2: Write Ready                               │ │
-│  │  Socket 3: Waiting...                                │ │
-│  └──────────────────────────────────────────────────────┘ │
-└────────────────────────────────────────────────────────────┘
+frame = encode_frame(message)                     # once
+await gather(*(send_bytes(c, frame) for c in members))
 ```
 
-### How Async Works
+`send_bytes` writes into the socket's buffer and normally returns without
+waiting. It waits only when that buffer is past its high-water mark, which
+means this client is not reading fast enough. It then waits at most
+`write_timeout` (10 s), and on timeout the client is disconnected and counted
+as a slow client.
 
-**Traditional (Blocking):**
-```python
-# Thread 1
-data = socket.recv()  # BLOCKS
-process(data)
+So one stalled member costs the broadcast at most one timeout, once, and the
+other members are not delayed by it. Total work per message is O(members): one
+encode plus one buffer append per member.
 
-# Thread 2
-data = socket.recv()  # BLOCKS
-process(data)
+## Connection lifecycle
 
-# Problem: Need N threads for N clients
+```
+accept ─> AUTH (30 s deadline, unique username) ─> command loop ─> close()
+                                                      │
+                 QUIT / EOF / idle 300 s / protocol error / failed or slow send
 ```
 
-**Asyncio (Non-Blocking):**
-```python
-# Single thread
-data = await reader.read()  # Yields control
-process(data)
+Two flags keep cleanup correct:
+- `_closing` means "stop reading and sending". QUIT, a failed send or `close()` sets it.
+- `_cleaned_up` makes `close()` run its work exactly once, however the connection ended.
 
-# When socket has data, event loop wakes this task
-# All 1000 clients share 1 thread!
-```
+`close()` then:
+1. leaves every room;
+2. frees the username;
+3. tells each remaining room `USER_LEFT`;
+4. closes the socket, aborting it if the peer will not finish the close within 2 s.
 
-### Key Concepts
+A failed send also detaches the connection at once: it leaves every room and
+the transport is aborted. Later broadcasts stop targeting it, and its read
+loop wakes up to run `close()`.
 
-**Coroutine:**
-```python
-async def my_function():
-    await some_async_operation()
-    return result
+## Abuse controls (enhanced server)
 
-# Creates a coroutine object (not executed yet)
-coro = my_function()
+| Control | Where | Rule |
+|---|---|---|
+| Message rate | `RateLimiter` | Token buckets keyed by ("user", name) and ("ip", address). A message needs a token from **both**, taken atomically: a refusal by one bucket charges neither. The IP bucket allows 300/min (burst scales by the same ratio), so a few users behind one NAT are fine, but one machine cannot multiply its allowance with new names. Idle full buckets are pruned, so memory follows active clients. |
+| Join rate | `RateLimiter` | Its own per-user bucket |
+| Connections | `ConnectionLimiter` | 10,000 total, 100 per IP, checked at accept |
+| Input | `InputValidator` | Usernames `[A-Za-z0-9_-]`, 1-50 chars; room names the same, 1-100 chars; messages up to 10,000 chars, no NUL bytes; at most 50 rooms per user and 1,000 members per room. XSS regexes run on a normalised copy (HTML entities decoded 3×, NFKC, control/format characters removed). |
+| Frame size | protocol | 128 KiB |
 
-# Execute in event loop
-result = await coro
-```
+## Observability
 
-**Task:**
-```python
-# Wrap coroutine in Task (scheduled immediately)
-task = asyncio.create_task(my_function())
+- **Counters and gauges.** The hot path only increments counters and appends
+  the handling time to a fixed-size deque (the last 10,000 samples).
+- **Scrape-time work.** Percentiles (nearest rank) and the message rate are
+  computed only when `/metrics` is scraped, never per message.
+- **HTTP endpoints.** A tiny HTTP responder on the metrics port serves
+  `/metrics`, `/health` (computed live: 503 when shutting down or at the
+  connection cap) and `/stats`.
+- **Compose stack.** It provisions a Prometheus data source and an
+  eight-panel Grafana dashboard.
 
-# Run multiple concurrently
-results = await asyncio.gather(task1, task2, task3)
-```
+## Shutdown
 
-**Future:**
-```python
-# Low-level awaitable
-future = asyncio.Future()
+On SIGINT or SIGTERM the server:
+1. stops accepting connections;
+2. sends `BYE` to every client and detaches them;
+3. waits for the handler tasks (bounded);
+4. closes the metrics listener.
 
-# Set result from another coroutine
-future.set_result(42)
+`tests/test_hardening.py` checks that this finishes promptly with clients
+still connected.
 
-# Awaiting code proceeds
-result = await future
-```
+## Scaling and its limits
 
----
+- **One core per process.** To use more cores, run more processes or
+  containers behind the load balancer. The compose file runs two behind
+  nginx `least_conn`.
+- **Rooms do not span processes.** Two users on different replicas, in the
+  same room name, do not see each other's messages. Usernames are also
+  unique only per process.
+  - The fix is a backplane: publish each room message to Redis pub/sub or
+    NATS, and have every process deliver it to its local members.
+  - The alternative is to route by room, which conflicts with
+    one-connection-many-rooms.
+  - Neither is implemented.
+- **No persistence.** Messages are delivered live and never stored. A client
+  that is offline misses them.
+- **No authentication or TLS.** AUTH claims a free name. In production, put
+  TLS on the load balancer and verify a token in AUTH.
 
-## Performance Characteristics
+## The two servers
 
-### Scalability
-
-| Metric | Value | Bottleneck |
-|--------|-------|------------|
-| Max Connections | 10,000+ | OS file descriptors |
-| Max Rooms | 1,000+ | Memory (set overhead) |
-| Message Latency | <1ms | Network RTT |
-| CPU Usage (1000 clients) | 35% | JSON serialization |
-| Memory per Connection | 100KB | Python object overhead |
-
-### Optimization Opportunities
-
-1. **JSON → MessagePack**: 3x smaller, 2x faster
-2. **C Extension**: Critical path in Cython
-3. **uvloop**: Drop-in replacement for asyncio (2x faster)
-4. **Redis Pub/Sub**: Horizontal scaling across servers
-5. **Pre-allocated Buffers**: Reduce GC pressure
-
----
-
-## Testing Strategy
-
-### Unit Tests
-- Protocol encoding/decoding
-- Room join/leave logic
-- Error handling
-
-### Integration Tests
-- Full client-server roundtrip
-- Multi-client message broadcast
-- Disconnect scenarios
-
-### Stress Tests
-- 1000+ concurrent connections
-- High message throughput
-- Memory leak detection
-
-### Chaos Tests
-- Random disconnects
-- Invalid protocol messages
-- Out-of-order frames
-
----
-
-## Production Deployment
-
-### Single Server
-```
-┌────────────────────┐
-│    Load Balancer   │ (Nginx/HAProxy)
-│   (TLS Termination)│
-└─────────┬──────────┘
-          │
-          ▼
-┌────────────────────┐
-│   Chat Server      │ Port 8888
-│   (Python asyncio) │
-└────────────────────┘
-```
-
-### Multi-Server (Horizontal Scaling)
-```
-┌────────────────────┐
-│  Load Balancer     │
-└─────────┬──────────┘
-          │
-     ┌────┴────┬────────────┐
-     ▼         ▼            ▼
-┌─────────┐ ┌─────────┐ ┌─────────┐
-│ Server 1│ │ Server 2│ │ Server 3│
-└────┬────┘ └────┬────┘ └────┬────┘
-     │           │            │
-     └───────────┴────────────┘
-                 │
-                 ▼
-         ┌──────────────┐
-         │ Redis Pub/Sub│ (Message Bus)
-         └──────────────┘
-```
-
-### Monitoring Stack
-```
-┌────────────────────────────────────────┐
-│         Prometheus (Metrics)           │
-│  - Connection count                    │
-│  - Message rate                        │
-│  - Error rate                          │
-└─────────────┬──────────────────────────┘
-              │
-              ▼
-┌────────────────────────────────────────┐
-│         Grafana (Visualization)        │
-│  - Real-time dashboards                │
-│  - Alerting rules                      │
-└────────────────────────────────────────┘
-
-┌────────────────────────────────────────┐
-│       ELK Stack (Logging)              │
-│  - Elasticsearch (storage)             │
-│  - Logstash (parsing)                  │
-│  - Kibana (queries)                    │
-└────────────────────────────────────────┘
-```
-
----
-
-## Security Considerations
-
-### Authentication
-- JWT tokens
-- OAuth2 integration
-- Rate limiting per user
-
-### Encryption
-- TLS 1.3 for transport
-- End-to-end encryption for messages
-- Certificate pinning
-
-### DoS Protection
-- Max frame size (10MB)
-- Connection timeout (5 min)
-- Rate limiting (100 msg/min)
-- Max rooms per user (10)
-
-### Input Validation
-- Sanitize room names
-- Limit message length
-- Escape HTML/JS in text
-
----
-
-This architecture demonstrates:
-✅ Network programming fundamentals
-✅ Asyncio mastery
-✅ Production-grade error handling
-✅ Scalable design patterns
-✅ Real-world system architecture
+- `app/server/enhanced_server.py` is the deployed server. It adds connection
+  limits, rate limiting, metrics HTTP, health and shutdown.
+  - `main.py` and `python -m app.main server` both start it.
+- `app/server/server.py` is the minimal core: framing, rooms and lifecycle,
+  with no policy. The integration tests use it to test those parts alone.

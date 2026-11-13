@@ -1,53 +1,25 @@
-# Multi-stage Dockerfile for Production Deployment
-# Optimized for minimal image size and security
+# Chat server image. The server uses only the Python standard library, so the
+# image needs no third-party packages (test tools are in requirements-dev.txt).
+FROM python:3.12-slim
 
-# Stage 1: Builder
-FROM python:3.11-slim as builder
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-WORKDIR /build
-
-# Install build dependencies
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-    gcc \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy requirements
-COPY requirements.txt .
-
-# Install Python dependencies
-RUN pip install --no-cache-dir --user -r requirements.txt
-
-
-# Stage 2: Runtime
-FROM python:3.11-slim
-
-# Create non-root user for security
-RUN useradd --create-home --shell /bin/bash chatuser
-
+# Run as a non-root user
+RUN useradd --create-home --shell /usr/sbin/nologin chatuser
 WORKDIR /app
 
-# Copy Python packages from builder
-COPY --from=builder /root/.local /home/chatuser/.local
-
-# Copy application code
 COPY app/ ./app/
-
-# Change ownership
+COPY main.py ./
 RUN chown -R chatuser:chatuser /app
-
-# Switch to non-root user
 USER chatuser
 
-# Add local bin to PATH
-ENV PATH=/home/chatuser/.local/bin:$PATH
+# 8888: chat protocol (TCP). 9090: /metrics, /health, /stats (HTTP).
+EXPOSE 8888 9090
 
-# Expose server port
-EXPOSE 8888
+# Checks the real health endpoint. The slim image has no curl, so use Python.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=5s --retries=3 \
+    CMD python -c "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health' % os.getenv('CHAT_METRICS_PORT', '9090'), timeout=4)" || exit 1
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import socket; s=socket.socket(); s.connect(('127.0.0.1', 8888)); s.close()" || exit 1
-
-# Default command: run server
-CMD ["python", "-m", "app.main", "server", "--host", "0.0.0.0", "--port", "8888"]
+# The production server: rate limiting, connection limits, metrics, health.
+CMD ["python", "main.py"]
