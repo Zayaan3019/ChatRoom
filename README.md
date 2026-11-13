@@ -18,7 +18,7 @@ From `bench/RESULTS.md`: one process on one core, Python 3.12, Core Ultra 7 155H
 | Idle connections held | **10,000** at 7.8 KiB each |
 
 Later measurements, same machine:
-- Fan-out with no task per member delivers 1.45-1.55x the frames per second of the version above, measured back to back.
+- Fan-out writes healthy members directly and `asyncio.gather`s only the backed-up ones: 1.45-1.55x the frames per second of the version above, measured back to back.
 - Two replicas sharing Redis deliver 85,594 frames/s to a room split across them.
 - A message crossing replicas arrives in 0.79 ms p50.
 
@@ -175,7 +175,7 @@ app/core/metrics.py             counters, percentiles, Prometheus text
 app/core/config.py              ServerConfig / ClientConfig from CHAT_* variables
 app/server/cluster.py           backplane: LocalCluster (one process) / RedisCluster (replicas)
 app/server/connection.py        one client: login, commands, history, send, cleanup
-app/server/room_manager.py      local room members; encode-once, zero-task fan-out
+app/server/room_manager.py      local room members; encode once, direct writes, asyncio.gather over slow readers
 app/server/proxy_protocol.py    PROXY protocol v1/v2 behind a load balancer
 app/server/enhanced_server.py   TLS, limits, metrics HTTP, shutdown (what runs in production)
 app/server/server.py            minimal server (no limits/metrics), used by tests

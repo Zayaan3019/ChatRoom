@@ -56,7 +56,7 @@ member's socket buffer is past its high-water mark (a slow client). In the
 50-member scenario this took deliveries from 34,515/s to 67,695/s, and 1:1
 went from 6,194 to 7,504 msg/s.
 
-## Cluster mode, TLS and zero-task fan-out (2026-11-13)
+## Cluster mode, TLS and a narrower gather in fan-out (2026-11-13)
 
 These come from `bench/run_suite.sh`, which runs every scenario below in one
 `python:3.12-slim` container, with Redis 7.4 in a second container on the
@@ -70,12 +70,12 @@ docker run --rm --network chatbench -v "$PWD":/src -w /src python:3.12-slim \
     sh bench/run_suite.sh redis://chatbench-redis:6379/0
 ```
 
-### Fan-out without a task per member
+### Fan-out: `asyncio.gather` only where waiting is needed
 
 A broadcast now writes the encoded frame into each member's socket buffer
 synchronously. It awaits only members whose buffer is past its high-water
 mark: slow readers, still capped at `write_timeout` each and awaited
-concurrently. Before, `gather()` wrapped every member's send in its own Task.
+concurrently with `asyncio.gather`. Before, the `gather` wrapped every member's send in its own Task.
 
 That Task was the main per-member cost. Previous commit vs this one, back to
 back in the same container (two rounds, median of 3 each):
