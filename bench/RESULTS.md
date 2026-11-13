@@ -56,13 +56,89 @@ member's socket buffer is past its high-water mark (a slow client). In the
 50-member scenario this took deliveries from 34,515/s to 67,695/s, and 1:1
 went from 6,194 to 7,504 msg/s.
 
+## Cluster mode, TLS and zero-task fan-out (2026-11-13)
+
+These come from `bench/run_suite.sh`, which runs every scenario below in one
+`python:3.12-slim` container, with Redis 7.4 in a second container on the
+same Docker network. Same machine as above; median of 3 runs each.
+
+```bash
+docker network create chatbench
+docker run -d --name chatbench-redis --network chatbench redis:7.4-alpine \
+    redis-server --appendonly yes --appendfsync everysec
+docker run --rm --network chatbench -v "$PWD":/src -w /src python:3.12-slim \
+    sh bench/run_suite.sh redis://chatbench-redis:6379/0
+```
+
+### Fan-out without a task per member
+
+A broadcast now writes the encoded frame into each member's socket buffer
+synchronously. It awaits only members whose buffer is past its high-water
+mark: slow readers, still capped at `write_timeout` each and awaited
+concurrently. Before, `gather()` wrapped every member's send in its own Task.
+
+That Task was the main per-member cost. Previous commit vs this one, back to
+back in the same container (two rounds, median of 3 each):
+
+| Scenario | Speed-up |
+|---|---:|
+| 50-member room, frames delivered/s | **1.45x - 1.55x** |
+| 1:1 pipelined, messages/s | 1.22x - 1.48x |
+| 1:1 latency | unchanged (p50 0.39 - 0.51 ms both) |
+
+The same build now also stores every message (in memory, for history) and
+gives it an ID, so the speed-up is net of that work.
+
+### Results for this build
+
+| Scenario | Messages/s | Frames delivered/s | Latency p50 / p99 |
+|---|---:|---:|---:|
+| One server, 50 members, 5 senders | 1,847 | **92,338** | (saturated) |
+| One server, 1:1 pipelined | **10,922** | 21,843 | (saturated) |
+| One server, 1:1, one in flight | | | **0.48 / 1.14 ms** |
+| **Two replicas + Redis**, 50 members split over both, 5 senders | 1,712 | **85,594** | (saturated) |
+| Two replicas + Redis, 1:1 across replicas, pipelined | 1,687 | 3,375 | 33 / 93 ms |
+| Two replicas + Redis, 1:1 across replicas, one in flight | | | **0.79 / 2.97 ms** |
+| **TLS** + token login, one server, 50 members | 1,067 | 53,358 | (saturated) |
+| TLS, 1:1 pipelined | 5,491 | 10,982 | (saturated) |
+| TLS, 1:1, one in flight | | | 0.47 / 1.20 ms |
+
+**Two replicas.**
+- A room split over two replicas delivers about the same frames per second
+  as one server holding the whole room. Each message also takes a Redis round
+  trip and a pub/sub hop, while the fan-out work is shared by two processes.
+- The cross-replica hop adds about 0.3 ms at p50.
+- One sending connection is limited by the Redis round trip (about 1.7k
+  msg/s). The server finishes one message, store and publish included,
+  before it reads that connection's next one. That is what keeps each
+  sender's messages in order and lets every message be acknowledged with its
+  ID. Total throughput grows with the number of senders, not with one
+  sender's speed.
+
+**TLS in the server process.**
+- Large-room throughput is about 40% lower. Each member's copy is
+  encrypted separately.
+- Latency at light load is unchanged.
+- Memory per connection is high:
+
+| | Plain TCP | TLS |
+|---|---:|---:|
+| Server memory per idle connection | 7.8 KiB | **288 KiB** (2,000 connections: RSS 56 -> 620 MiB) |
+| Full handshakes per second (client on the same CPU) | | 393 |
+
+asyncio's TLS layer keeps a 256 KiB read buffer per connection. That is why
+the compose stack ends TLS at nginx: a server then holds plain connections
+at 7.8 KiB each. In-process TLS is for a single node with a modest number of
+clients.
+
 ## Limits of these numbers
 
-- **Single process.** Python runs one event loop per process, so scaling
-  means more processes behind the load balancer. Rooms do not span processes
-  (there is no backplane); see ARCHITECTURE.md.
+- **One process per core.** Python runs one event loop per process.
+  Scaling means more replicas behind the load balancer, and rooms now span
+  them through Redis. The replicas and Redis above share one machine with
+  the load generator.
 - **Same-machine load generator.** It shares the CPU, so these are lower
-  bounds for the server. The server CPU reading (100%) shows the server was
-  the bottleneck in the throughput runs.
-- **Not measured:** WAN latency, TLS (not implemented), or more than 10,000
-  connections.
+  bounds for the server. The server CPU reading (about 100%) shows the
+  server was the bottleneck in the throughput runs.
+- **Not measured:** WAN latency, Redis on its own host, nginx's TLS
+  throughput, or more than 10,000 connections.

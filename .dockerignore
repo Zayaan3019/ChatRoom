@@ -6,3 +6,7 @@ tests/
 docs/
 *.md
 chat_server.log
+secrets/
+*.jwt
+users.json
+bench/

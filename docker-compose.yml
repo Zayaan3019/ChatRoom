@@ -1,34 +1,68 @@
-# Two chat servers behind an Nginx TCP load balancer, with Prometheus and Grafana.
+# Two chat servers sharing rooms through Redis, behind Nginx (TLS), with
+# Prometheus and Grafana.
 #
 #   docker compose up --build
 #
-#   chat (TCP)   localhost:8888   -> nginx -> chat-server-1 / chat-server-2
+#   chat (TLS)   localhost:8888   -> nginx (TLS ends here) -> chat-server-1 / -2
 #   health       http://localhost/health   (nginx -> a server's :9090)
 #   Prometheus   http://localhost:9090
 #   Grafana      http://localhost:3000     (admin / $GRAFANA_ADMIN_PASSWORD, default "admin";
 #                                           host port $GRAFANA_PORT, default 3000)
 #
-# Settings: put CHAT_* overrides in a .env file next to this one (copy
-# .env.example). Compose reads it for the ${...} substitutions below; the file
-# is optional.
+# First start: the `init` service creates ./secrets (a private CA, the server
+# certificate, the login-token secret and the Redis password). Nothing is
+# overwritten on later starts. Then, from this folder:
 #
-# Note: each server keeps its own rooms. Two users connected through nginx to
-# different servers are not in the same room (no cross-server backplane).
+#   python -m app.core.auth issue-token --user alice --secret-file secrets/jwt.secret > alice.jwt
+#   python -m app.main client --tls --ca secrets/ca.pem --token-file alice.jwt
+#
+# How it fits together:
+#   * Rooms span both servers: every message goes through Redis (a stream per
+#     room for history, plus pub/sub for live delivery), so users on
+#     different servers share rooms, usernames are unique across servers, and
+#     history survives restarts (Redis keeps an append-only file).
+#   * TLS ends at nginx, which passes each client's real address to the
+#     servers with the PROXY protocol, so per-IP limits see real clients.
+#     Server-to-nginx traffic stays on this private network. Run a server
+#     alone with CHAT_TLS_CERT/CHAT_TLS_KEY to end TLS at the server instead.
+#
+# Settings: put overrides in a .env file next to this one (copy .env.example).
 
 x-chat-server: &chat-server
   build: .
   restart: unless-stopped
   networks: [chat-network]
+  volumes:
+    - runtime-secrets:/run/secrets:ro
   environment:
     CHAT_HOST: 0.0.0.0
     CHAT_PORT: 8888
     CHAT_METRICS_PORT: 9090
+    # Login: "token" (signed JWTs) by default; "password" needs CHAT_USERS_FILE.
+    CHAT_AUTH_MODE: ${CHAT_AUTH_MODE:-token}
+    CHAT_JWT_SECRET_FILE: /run/secrets/jwt.secret
+    # TLS ends at nginx (below); the hop to the servers is this private network.
+    CHAT_ALLOW_PLAINTEXT_AUTH: "true"
+    CHAT_PROXY_PROTOCOL: "true"
+    # Only nginx may send PROXY headers; its name is re-resolved if it moves.
+    CHAT_TRUSTED_PROXIES: nginx
+    # Shared rooms, usernames and history
+    CHAT_REDIS_URL: redis://redis:6379/0
+    CHAT_REDIS_PASSWORD_FILE: /run/secrets/redis.secret
+    CHAT_HISTORY_PER_ROOM: ${CHAT_HISTORY_PER_ROOM:-10000}
+    CHAT_HISTORY_TTL_DAYS: ${CHAT_HISTORY_TTL_DAYS:-30}
     CHAT_MAX_CONNECTIONS: ${CHAT_MAX_CONNECTIONS:-10000}
     CHAT_MAX_CONNECTIONS_PER_IP: ${CHAT_MAX_CONNECTIONS_PER_IP:-100}
     CHAT_ENABLE_RATE_LIMITING: ${CHAT_ENABLE_RATE_LIMITING:-true}
     CHAT_MAX_MESSAGES_PER_MINUTE: ${CHAT_MAX_MESSAGES_PER_MINUTE:-60}
     CHAT_MAX_MESSAGES_PER_MINUTE_PER_IP: ${CHAT_MAX_MESSAGES_PER_MINUTE_PER_IP:-300}
+    CHAT_MAX_AUTH_ATTEMPTS_PER_MINUTE_PER_IP: ${CHAT_MAX_AUTH_ATTEMPTS_PER_MINUTE_PER_IP:-10}
     CHAT_LOG_LEVEL: ${CHAT_LOG_LEVEL:-INFO}
+  depends_on:
+    init:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
   # Only nginx publishes the chat port; the servers' metrics ports are
   # published on 9091/9092 for debugging.
   healthcheck:
@@ -39,15 +73,61 @@ x-chat-server: &chat-server
     start_period: 5s
 
 services:
+  # One-shot: creates ./secrets on first start (kept afterwards) and copies
+  # what the services need -- not the CA's private key -- into a volume.
+  init:
+    build: .
+    user: "0:0"
+    command: ["python", "scripts/init_secrets.py", "/secrets", "--export", "/runtime", "--owner", "10001:10001"]
+    environment:
+      CHAT_TLS_HOSTS: ${CHAT_TLS_HOSTS:-localhost,127.0.0.1,chat-server-1,chat-server-2,nginx}
+    volumes:
+      - ./secrets:/secrets
+      - runtime-secrets:/runtime
+    restart: "no"
+    networks: [chat-network]
+
+  redis:
+    image: redis:7.4-alpine
+    container_name: chat-redis
+    # The password goes in a root-only config file, not on the command line
+    # (where `ps` would show it). The image's entrypoint then drops to the
+    # redis user. appendfsync everysec: at most ~1 s of messages is lost if
+    # the machine (not just the process) crashes.
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        umask 077 &&
+        printf 'requirepass %s\n' "$$(cat /run/secrets/redis.secret)" > /etc/redis-auth.conf &&
+        chown redis /etc/redis-auth.conf &&
+        exec docker-entrypoint.sh redis-server /etc/redis-auth.conf
+        --appendonly yes --appendfsync everysec
+        --maxmemory-policy noeviction --save ""
+    volumes:
+      - runtime-secrets:/run/secrets:ro
+      - redis-data:/data
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    networks: [chat-network]
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$(cat /run/secrets/redis.secret)\" redis-cli ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   chat-server-1:
     <<: *chat-server
     container_name: chat-server-1
+    hostname: chat-server-1
     ports:
       - "9091:9090"
 
   chat-server-2:
     <<: *chat-server
     container_name: chat-server-2
+    hostname: chat-server-2
     ports:
       - "9092:9090"
 
@@ -59,6 +139,7 @@ services:
       - "8888:8888"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - runtime-secrets:/run/secrets:ro
     depends_on:
       chat-server-1:
         condition: service_healthy
@@ -121,5 +202,7 @@ networks:
     driver: bridge
 
 volumes:
+  runtime-secrets:
+  redis-data:
   prometheus-data:
   grafana-data:

@@ -7,13 +7,17 @@ import json
 import logging
 import signal
 import socket
+import ssl
 from asyncio import StreamReader, StreamWriter
 from typing import Optional, Set
 
 from ..core.config import ServerConfig, get_server_config
 from ..core.metrics import MetricsCollector, get_metrics
 from ..core.rate_limiter import ConnectionLimiter, RateLimiter
+from .cluster import Cluster, LocalCluster, RedisCluster
 from .connection import ClientConnection
+from .proxy_protocol import ProxyProtocolError, TrustedProxies
+from .proxy_protocol import read_header as read_proxy_header
 from .room_manager import RoomManager
 
 logger = logging.getLogger(__name__)
@@ -26,6 +30,29 @@ def listen_options() -> dict:
     if hasattr(socket, "SO_REUSEPORT"):
         options["reuse_port"] = True
     return options
+
+
+def build_tls_context(cert: str, key: str) -> ssl.SSLContext:
+    """Server-side TLS: TLS 1.2 minimum, the library's modern cipher
+    defaults, no client certificate required."""
+    ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(certfile=cert, keyfile=key)
+    return ctx
+
+
+def build_cluster(config: ServerConfig) -> Cluster:
+    if config.redis_url:
+        return RedisCluster(
+            config.redis_url,
+            namespace=config.redis_namespace,
+            history_per_room=config.history_per_room,
+            history_ttl_seconds=config.history_ttl_days * 86400,
+            lease_seconds=config.lease_seconds,
+            replica_id=config.replica_id,
+        )
+    return LocalCluster(history_per_room=config.memory_history_per_room,
+                        max_bytes=config.memory_history_bytes)
 
 
 class EnhancedChatServer:
@@ -46,12 +73,18 @@ class EnhancedChatServer:
         port: Optional[int] = None,
         config: Optional[ServerConfig] = None,
         metrics: Optional[MetricsCollector] = None,
+        cluster: Optional[Cluster] = None,
     ) -> None:
-        self.config = config or get_server_config()
+        self.config = (config or get_server_config()).validate()
         self.host = host if host is not None else self.config.host
         self.port = port if port is not None else self.config.port
 
-        self.room_manager = RoomManager()
+        self.cluster = cluster or build_cluster(self.config)
+        self.room_manager = RoomManager(self.cluster)
+        self.tls_context: Optional[ssl.SSLContext] = None
+        self.trusted_proxies = TrustedProxies(self.config.trusted_proxies if self.config.proxy_protocol else None)
+        if self.config.tls_cert:
+            self.tls_context = build_tls_context(self.config.tls_cert, self.config.tls_key)
         self.rate_limiter: Optional[RateLimiter] = None
         if self.config.enable_rate_limiting:
             self.rate_limiter = RateLimiter(
@@ -59,6 +92,7 @@ class EnhancedChatServer:
                 joins_per_minute=self.config.max_joins_per_minute,
                 burst=self.config.rate_limit_burst,
                 messages_per_minute_per_ip=self.config.max_messages_per_minute_per_ip,
+                auth_attempts_per_minute_per_ip=self.config.max_auth_attempts_per_minute_per_ip,
             )
         self.connection_limiter = ConnectionLimiter(
             max_total=self.config.max_connections,
@@ -66,6 +100,7 @@ class EnhancedChatServer:
         )
         self.metrics = metrics or get_metrics()
         self.metrics.set_rooms_provider(lambda: len(self.room_manager))
+        self.metrics.set_cluster_provider(self.cluster.stats)
 
         self.server: Optional[asyncio.AbstractServer] = None
         self.metrics_port: Optional[int] = None  # actual port once listening
@@ -81,14 +116,26 @@ class EnhancedChatServer:
 
     async def start(self) -> None:
         self._register_signals()
+        # The shared backend first: a replica that cannot reach Redis must
+        # not accept clients it cannot serve.
+        await self.cluster.start()
         if self.config.enable_metrics:
             await self._start_metrics_server()
-        self.server = await asyncio.start_server(self._handle_client, self.host, self.port, **listen_options())
+        self.server = await asyncio.start_server(
+            self._handle_client, self.host, self.port,
+            ssl=self.tls_context, ssl_handshake_timeout=10.0 if self.tls_context else None,
+            **listen_options(),
+        )
         self._health_check_task = asyncio.create_task(self._health_check_loop())
         addrs = ", ".join(str(sock.getsockname()) for sock in self.server.sockets)
         logger.info(f"Chat server listening on {addrs}")
         if self.metrics_port:
             logger.info(f"Metrics: http://{self.host}:{self.metrics_port}/metrics  health: /health")
+        logger.info(
+            f"Security: auth={self.config.auth_mode}, tls={'on' if self.tls_context else 'off'}"
+            f"{', proxy protocol from ' + self.config.trusted_proxies if self.config.proxy_protocol else ''}; "
+            f"cluster={'redis' if self.cluster.shared else 'single process'}"
+        )
         logger.info(
             f"Limits: max_connections={self.config.max_connections}, "
             f"rate_limiting={'on' if self.rate_limiter else 'off'} "
@@ -106,6 +153,10 @@ class EnhancedChatServer:
 
     async def _handle_client(self, reader: StreamReader, writer: StreamWriter) -> None:
         addr = writer.get_extra_info("peername")
+        if self.config.proxy_protocol:
+            addr = await self._client_address(reader, writer, addr)
+            if addr is None:
+                return
         ip_address = addr[0] if addr else "unknown"
 
         if self._shutting_down or not await self.connection_limiter.acquire(ip_address):
@@ -136,6 +187,26 @@ class EnhancedChatServer:
                 self._connection_tasks.discard(task)
             await self.connection_limiter.release(ip_address)
             await self.metrics.decrement_connections()
+
+    async def _client_address(self, reader: StreamReader, writer: StreamWriter, peer):
+        """The real client address from the PROXY header, or None (and the
+        socket closed) if the peer is not a trusted proxy or the header is bad."""
+        peer_ip = peer[0] if peer else None
+        try:
+            if not await self.trusted_proxies.contains(peer_ip):
+                raise ProxyProtocolError(f"{peer_ip} is not a trusted proxy")
+            client = await read_proxy_header(reader, timeout=5.0)
+        except ProxyProtocolError as e:
+            logger.warning(f"Connection refused: {e}")
+            await self.metrics.increment_failed_connections()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return None
+        # "PROXY UNKNOWN" / v2 LOCAL: the balancer's own health probe.
+        return client or peer
 
     # ------------------------------------------------------- HTTP endpoint
 
@@ -205,6 +276,7 @@ class EnhancedChatServer:
             and self.server is not None
             and self.server.is_serving()
             and len(self._connections) < self.config.max_connections
+            and self.cluster.healthy
         )
 
     async def _health_check_loop(self) -> None:
@@ -269,6 +341,11 @@ class EnhancedChatServer:
                 except Exception:
                     pass
 
+        try:
+            await asyncio.wait_for(self.cluster.close(), timeout=5.0)
+        except Exception as e:
+            logger.warning(f"Cluster shutdown: {e!r}")
+
         m = await self.metrics.get_metrics()
         logger.info(
             f"Final metrics: connections={m.total_connections}, messages={m.total_messages}, "
@@ -289,6 +366,7 @@ class EnhancedChatServer:
             },
             "connection_limiter": self.connection_limiter.get_stats(),
             "rooms": self.room_manager.get_stats(),
+            "security": {"auth_mode": self.config.auth_mode, "tls": self.tls_context is not None},
         }
         stats["rate_limiter"] = self.rate_limiter.get_stats() if self.rate_limiter else {"enabled": False}
         return stats

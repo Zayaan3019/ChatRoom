@@ -89,6 +89,7 @@ class RateLimiter:
         burst: int = 10,
         messages_per_minute_per_ip: Optional[int] = None,
         joins_per_minute_per_ip: Optional[int] = None,
+        auth_attempts_per_minute_per_ip: int = 10,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.burst = burst
@@ -99,7 +100,10 @@ class RateLimiter:
             ("user", "join"): joins_per_minute / 60.0,
             ("ip", "message"): (messages_per_minute_per_ip or messages_per_minute * 5) / 60.0,
             ("ip", "join"): (joins_per_minute_per_ip or joins_per_minute * 5) / 60.0,
+            # Login attempts: per IP only (the username is what is being proved).
+            ("ip", "auth"): auth_attempts_per_minute_per_ip / 60.0,
         }
+        self._auth_burst = max(1, auth_attempts_per_minute_per_ip)
         # The IP bucket's burst scales with its rate, so a handful of users
         # behind one NAT can each still send their own burst.
         self._ip_burst_factor = max(
@@ -122,7 +126,12 @@ class RateLimiter:
         bucket = self._buckets.get(bucket_key)
         if bucket is None:
             rate = self._rates.get((scope, action), 1.0)
-            burst = self.burst if scope == "user" else max(self.burst, round(self.burst * self._ip_burst_factor))
+            if action == "auth":
+                burst = self._auth_burst
+            elif scope == "user":
+                burst = self.burst
+            else:
+                burst = max(self.burst, round(self.burst * self._ip_burst_factor))
             bucket = TokenBucket(rate, burst, self._clock)
             self._buckets[bucket_key] = bucket
         return bucket
@@ -143,6 +152,14 @@ class RateLimiter:
     async def check_join(self, user_id: str, ip_address: Optional[str] = None) -> bool:
         """True if this user (and its IP) may join a room now."""
         return self._check("join", user_id, ip_address)
+
+    async def check_auth(self, ip_address: Optional[str]) -> bool:
+        """True if this IP may make another login attempt now. Every AUTH
+        costs a token, so password guessing is capped per address."""
+        self._checks += 1
+        if not ip_address:
+            return True
+        return _consume_all((self._bucket("ip", ip_address, "auth"),))
 
     async def check_action(self, user_id: str, action: str, ip_address: Optional[str] = None) -> bool:
         return self._check(action, user_id, ip_address)

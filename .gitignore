@@ -58,3 +58,8 @@ dmypy.json
 
 # Local settings (copy .env.example)
 .env
+
+# Keys, certificates and secrets (scripts/init_secrets.py) and login tokens
+secrets/
+*.jwt
+users.json

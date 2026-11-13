@@ -43,6 +43,9 @@ class Metrics:
     timeout_errors: int = 0
     disconnect_errors: int = 0
     slow_client_disconnects: int = 0
+    auth_failures: int = 0
+    backplane_errors: int = 0  # operations refused because Redis was unreachable
+    history_messages_sent: int = 0
 
     server_start_time: datetime = field(default_factory=datetime.now)
 
@@ -80,11 +83,15 @@ class MetricsCollector:
         # When set, the live room count comes from the room manager itself,
         # which is the source of truth.
         self._rooms_provider: Optional[Callable[[], int]] = None
+        self._cluster_provider: Optional[Callable[[], Dict]] = None
 
     # ---- recording -------------------------------------------------------
 
     def set_rooms_provider(self, provider: Callable[[], int]) -> None:
         self._rooms_provider = provider
+
+    def set_cluster_provider(self, provider: Callable[[], Dict]) -> None:
+        self._cluster_provider = provider
 
     async def increment_connections(self) -> None:
         self.metrics.total_connections += 1
@@ -133,6 +140,15 @@ class MetricsCollector:
 
     async def increment_slow_client_disconnects(self) -> None:
         self.metrics.slow_client_disconnects += 1
+
+    async def increment_auth_failures(self) -> None:
+        self.metrics.auth_failures += 1
+
+    async def increment_backplane_errors(self) -> None:
+        self.metrics.backplane_errors += 1
+
+    async def add_history_sent(self, count: int) -> None:
+        self.metrics.history_messages_sent += count
 
     # ---- reading ---------------------------------------------------------
 
@@ -203,7 +219,27 @@ class MetricsCollector:
             f'chat_errors_total{{type="timeout"}} {m.timeout_errors}',
             f'chat_errors_total{{type="disconnect"}} {m.disconnect_errors}',
             f'chat_errors_total{{type="slow_client"}} {m.slow_client_disconnects}',
+            f'chat_errors_total{{type="auth"}} {m.auth_failures}',
+            f'chat_errors_total{{type="backplane"}} {m.backplane_errors}',
         )
+        lines += block("chat_history_messages_sent_total", "counter",
+                       "Stored messages replayed to clients (JOIN, resume, HISTORY).",
+                       f"chat_history_messages_sent_total {m.history_messages_sent}")
+        if self._cluster_provider is not None:
+            c = self._cluster_provider()
+            lines += block("chat_backplane_up", "gauge",
+                           "1 when the shared backend (Redis) is reachable, or in single-process mode.",
+                           f"chat_backplane_up {1 if c.get('healthy') else 0}")
+            if c.get("mode") == "redis":
+                lines += block("chat_backplane_reconnects_total", "counter",
+                               "Subscriber reconnections to Redis.",
+                               f"chat_backplane_reconnects_total {c.get('subscriber_reconnects', 0)}")
+                lines += block("chat_backplane_repaired_messages_total", "counter",
+                               "Messages recovered from the stream after a subscriber gap.",
+                               f"chat_backplane_repaired_messages_total {c.get('repaired_messages', 0)}")
+                lines += block("chat_backplane_resyncs_total", "counter",
+                               "Gaps too long to replay; clients were told to resync.",
+                               f"chat_backplane_resyncs_total {c.get('resyncs', 0)}")
         lines += block("chat_uptime_seconds", "gauge", "Seconds since the server started.",
                        f"chat_uptime_seconds {m.uptime_seconds():.0f}")
         return "\n".join(lines) + "\n"

@@ -18,16 +18,29 @@ connections  Opens and authenticates COUNT connections, holds them, then
 
 The load generator runs in one asyncio process; when it, not the server, is
 the bottleneck the server CPU reading shows it (well under 100%).
+
+Cluster and security options (fanout):
+    --targets a:8888,b:8888   spread clients round-robin over several servers
+                              (replicas sharing Redis), so most deliveries
+                              cross the backplane
+    --tls --ca secrets/ca.pem connect with TLS, verifying the server
+    --token-secret-file F     log in with tokens signed by F (token mode)
 """
 import argparse
 import asyncio
 import json
 import os
 import platform
-import resource
+import ssl
 import statistics
 import struct
+import sys
 import time
+
+try:
+    import resource  # Linux/macOS: raise the open-file limit
+except ImportError:  # Windows
+    resource = None
 
 HEADER = struct.Struct("!I")
 
@@ -42,9 +55,26 @@ async def read(reader):
     return json.loads(await reader.readexactly(n))
 
 
+TLS = None          # ssl.SSLContext when --tls
+SERVER_NAME = None
+TOKEN_SECRET = None  # sign a token per client when set
+NAME_PREFIX = ""     # differs per repeated run, so names never collide
+
+
+def auth_frame(name):
+    if TOKEN_SECRET:
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+        from app.core.auth import issue_token
+        return {"type": "AUTH", "token": issue_token(name, TOKEN_SECRET)}
+    return {"type": "AUTH", "username": name}
+
+
 async def open_client(host, port, name, room=None):
-    reader, writer = await asyncio.open_connection(host, port)
-    writer.write(frame({"type": "AUTH", "username": name}))
+    if TLS is not None:
+        reader, writer = await asyncio.open_connection(host, port, ssl=TLS, server_hostname=SERVER_NAME or host)
+    else:
+        reader, writer = await asyncio.open_connection(host, port)
+    writer.write(frame(auth_frame(NAME_PREFIX + name)))
     await writer.drain()
     reply = await read(reader)
     if reply.get("type") != "AUTH_OK":
@@ -79,7 +109,12 @@ def pct(values, q):
 
 async def fanout(args):
     room = "bench"
-    clients = [await open_client(args.host, args.port, f"b{i}", room) for i in range(args.clients)]
+    targets = [(t.rsplit(":", 1)[0], int(t.rsplit(":", 1)[1])) for t in args.targets.split(",")] \
+        if args.targets else [(args.host, args.port)]
+    clients = []
+    for i in range(args.clients):
+        host, port = targets[i % len(targets)]  # senders 0,1,.. land on different servers
+        clients.append(await open_client(host, port, f"b{i}", room))
     # drain USER_JOINED notices
     await asyncio.sleep(0.5)
     for reader, _ in clients:
@@ -137,6 +172,8 @@ async def fanout(args):
         "deliveries_per_second": round(received / elapsed),
         "latency_ms_p50": round(pct(latencies, 0.50), 2),
         "latency_ms_p99": round(pct(latencies, 0.99), 2),
+        "servers": len(targets),
+        "tls": TLS is not None,
     }
     if cpu0 is not None:
         result["server_cpu_percent_of_one_core"] = round(100 * (cpu1 - cpu0) / elapsed)
@@ -200,11 +237,37 @@ def main():
     p.add_argument("--messages", type=int, default=2000)
     p.add_argument("--window", type=int, default=32)
     p.add_argument("--count", type=int, default=10000)
+    p.add_argument("--targets", help="host:port,host:port (fanout across replicas)")
+    p.add_argument("--tls", action="store_true")
+    p.add_argument("--ca", help="CA certificate for --tls")
+    p.add_argument("--server-name", help="certificate name to verify (default: host)")
+    p.add_argument("--token-secret-file", help="sign login tokens with this secret")
+    p.add_argument("--repeat", type=int, default=1, help="run N times and report the median run")
     args = p.parse_args()
 
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
-    result = asyncio.run(fanout(args) if args.scenario == "fanout" else connections(args))
+    global TLS, SERVER_NAME, TOKEN_SECRET
+    if args.tls:
+        TLS = ssl.create_default_context(cafile=args.ca)
+        SERVER_NAME = args.server_name
+    if args.token_secret_file:
+        with open(args.token_secret_file) as f:
+            TOKEN_SECRET = f.read().strip()
+    if resource is not None:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    global NAME_PREFIX
+    runs = []
+    for r in range(max(1, args.repeat)):
+        NAME_PREFIX = f"r{r}" if args.repeat > 1 else ""
+        runs.append(asyncio.run(fanout(args) if args.scenario == "fanout" else connections(args)))
+    key = "messages_per_second" if args.scenario == "fanout" else "connects_per_second"
+    if args.window == 1 and args.scenario == "fanout":
+        key = "latency_ms_p50"  # latency runs: the median latency run
+    ordered = sorted(runs, key=lambda r: r[key])
+    result = dict(ordered[len(ordered) // 2])
+    if len(runs) > 1:
+        result["runs"] = len(runs)
+        result[f"all_{key}"] = [r[key] for r in runs]
     result["python"] = platform.python_version()
     result["machine"] = platform.processor() or platform.machine()
     print(json.dumps(result, indent=2))
